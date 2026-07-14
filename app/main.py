@@ -33,6 +33,22 @@ Three account types, looked up by email at `/auth/login`:
 4. When a request fails with `INVALID_TOKEN` or `FORBIDDEN_ACCOUNT_TYPE`, the session is bad —
    send the user back to login.
 
+### Pagination
+Endpoints whose response schema is named `Page_...` (e.g. `Page_StudentAdminOut_`) share a
+common envelope:
+```
+{ "items": [...], "total": 87, "limit": 20, "offset": 0 }
+```
+- **`items`** — the rows for the current page, already filtered and sorted.
+- **`total`** — the total number of matching rows across all pages, not just the current response.
+- **`limit`** — the number of rows requested (each endpoint defines its own default and maximum).
+- **`offset`** — the number of matching rows skipped before the current page.
+
+Pages are addressed by `limit`/`offset` rather than a page number: `offset=0&limit=20` is the
+first page, `offset=20&limit=20` is the second, and so on. Iteration continues by incrementing
+`offset` by `limit` until `total` rows have been retrieved, or until `items` returns fewer rows
+than `limit`, which indicates the last page has been reached.
+
 ### Error shape
 Every error response is JSON, no matter the status code:
 ```
@@ -80,6 +96,24 @@ tags_metadata = [
         "the `academic` permission (super_admin/admin only).",
     },
     {
+        "name": "admin-attendance",
+        "description": "Mark/list attendance records for any class. Requires the `academic` "
+        "permission (super_admin/admin only).",
+    },
+    {
+        "name": "admin-results",
+        "description": "Enter/list/delete exam results for any class. `grade` is computed "
+        "server-side from marks/total. Requires the `academic` permission (super_admin/admin only).",
+    },
+    {
+        "name": "admin-counts",
+        "description": "Pre-aggregated attendance/results/roster numbers (present/absent/late "
+        "counts, results entry counts and marks sums, student counts per class), kept in sync "
+        "automatically whenever the underlying attendance/results/student rows change. Read-only "
+        "- lets the UI show class-level summaries without re-fetching and re-counting full row "
+        "sets. Requires the `academic` permission (super_admin/admin only).",
+    },
+    {
         "name": "admin-notices",
         "description": "CRUD for notices. Requires the `cms` permission (super_admin/admin/editor).",
     },
@@ -107,6 +141,12 @@ tags_metadata = [
         "description": "CRUD for teacher records, including password resets. Requires the "
         "`academic` permission (super_admin/admin only). Homeroom assignment is done via "
         "`PUT /admin/classes/{id}`, not here.",
+    },
+    {
+        "name": "admin-password-resets",
+        "description": "The admin queue of student/teacher password-reset requests: list "
+        "pending/accepted requests and accept one (clears the target's password so they can "
+        "set a new one at login). Requires the `academic` permission (super_admin/admin only).",
     },
     {
         "name": "admin-audit",

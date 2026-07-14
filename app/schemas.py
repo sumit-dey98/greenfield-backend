@@ -28,6 +28,43 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class SetInitialPasswordRequest(BaseModel):
+    """Self-service first-time password set. Only works when the account currently has no
+    password (an admin has cleared it, or it was never set) — it can never overwrite an
+    existing password."""
+    email: EmailStr
+    new_password: str
+
+
+class ResetRole(str, Enum):
+    student = "student"
+    teacher = "teacher"
+
+
+class ResetStatus(str, Enum):
+    pending = "pending"
+    accepted = "accepted"
+
+
+class PasswordResetRequestIn(BaseModel):
+    """A student/teacher asks an admin to reset their password. `role` tells the backend
+    which table to look the email up in."""
+    role: ResetRole
+    email: EmailStr
+
+
+class PasswordResetRequestOut(BaseModel):
+    id: int
+    email: EmailStr
+    role: str
+    status: str
+    is_active: bool
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
 class RefreshRequest(BaseModel):
     refresh_token: str
 
@@ -46,6 +83,14 @@ class StudentOut(BaseModel):
     email: EmailStr
     roll: Optional[int] = None
     class_id: Optional[str] = None
+    # Extra display fields — a student sees their own, a teacher sees their roster's.
+    gender: Optional[str] = None
+    dob: Optional[date_type] = None
+    phone: Optional[str] = None
+    guardian: Optional[str] = None
+    guardian_phone: Optional[str] = None
+    address: Optional[str] = None
+    avatar: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -57,6 +102,38 @@ class TeacherOut(BaseModel):
     email: EmailStr
     role: Optional[str] = None
     subject: Optional[str] = None
+    phone: Optional[str] = None
+    join_date: Optional[date_type] = None
+    avatar: Optional[str] = None
+    message: Optional[str] = None
+    bio: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class TeacherSelfUpdate(BaseModel):
+    """Fields a teacher may edit on their own profile (not email/subject/role — admin-managed)."""
+    phone: Optional[str] = None
+    avatar: Optional[str] = None
+    message: Optional[str] = None
+    bio: Optional[str] = None
+
+
+class FacultyOut(BaseModel):
+    """Public-facing faculty directory entry (the /faculty endpoint). Includes contact info
+    the school publishes on its public site — no password or internal fields."""
+    id: str
+    name: Optional[str] = None
+    role: Optional[str] = None
+    subject: Optional[str] = None
+    avatar: Optional[str] = None
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
+    class_id: Optional[str] = None
+    join_date: Optional[date_type] = None
+    bio: Optional[str] = None
+    message: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -93,7 +170,9 @@ class StudentIn(BaseModel):
     id: Optional[str] = None  # auto-generated (std_xxxxxxxx) if omitted
     name: str
     email: EmailStr
-    password: str  # plain text in, hashed server-side - never stored or returned as-is
+    # Optional: when omitted the account starts with no password and the student sets it
+    # themselves at first login (admins can only clear passwords, not set them).
+    password: Optional[str] = None
     roll: Optional[int] = None
     class_id: Optional[str] = None  # validated against classes.id if provided
     gender: Optional[Gender] = None
@@ -140,7 +219,9 @@ class TeacherIn(BaseModel):
     id: Optional[str] = None  # auto-generated (tch_xxxxxxxx) if omitted
     name: str
     email: EmailStr
-    password: str  # plain text in, hashed server-side - never stored or returned as-is
+    # Optional: when omitted the account starts with no password and the teacher sets it
+    # themselves at first login (admins can only clear passwords, not set them).
+    password: Optional[str] = None
     role: Optional[str] = None  # free-text job title
     subject_id: Optional[str] = None  # validated against subjects.id if provided
     phone: Optional[str] = None
@@ -185,9 +266,11 @@ class AuditLogOut(BaseModel):
     created_at: Optional[datetime] = None
     actor_id: str
     actor_role: str
+    actor_name: Optional[str] = None  # resolved from users; None if the actor no longer exists
     action: str
     resource_type: str
     resource_id: str
+    resource_name: Optional[str] = None  # resolved by resource_type; None if the target was deleted
 
     class Config:
         from_attributes = True
@@ -308,6 +391,7 @@ class ResultOut(BaseModel):
     exam: Optional[str] = None
     subject_id: Optional[str] = None
     subject_name: Optional[str] = None
+    subject_code: Optional[str] = None
     marks: Optional[int] = None
     total: Optional[int] = None
     grade: Optional[str] = None
@@ -338,8 +422,68 @@ class ScheduleEntryOut(BaseModel):
     room: Optional[str] = None
     subject_id: Optional[str] = None
     subject_name: Optional[str] = None
+    subject_code: Optional[str] = None
     teacher_id: Optional[str] = None
     teacher_name: Optional[str] = None
+
+
+class StudentSelfUpdate(BaseModel):
+    """Fields a student may edit on their own profile."""
+    phone: Optional[str] = None
+    address: Optional[str] = None
+    avatar: Optional[str] = None
+    guardian: Optional[str] = None
+    guardian_phone: Optional[str] = None
+
+
+class StudentClassOut(BaseModel):
+    """A student's own class info, with the homeroom teacher's name/subject joined in."""
+    id: str
+    name: Optional[str] = None
+    grade: Optional[int] = None
+    section: Optional[str] = None
+    room: Optional[str] = None
+    teacher_id: Optional[str] = None
+    teacher_name: Optional[str] = None
+    teacher_subject: Optional[str] = None
+
+
+# ---- Admin attendance / results (admin-scoped, academic permission) ----
+
+
+class AttendanceAdminOut(BaseModel):
+    id: str
+    student_id: str
+    student_name: Optional[str] = None
+    class_id: Optional[str] = None
+    date: Optional[date_type] = None
+    status: Optional[str] = None
+
+
+class ResultAdminOut(BaseModel):
+    id: str
+    student_id: str
+    student_name: Optional[str] = None
+    class_id: Optional[str] = None
+    exam_id: Optional[str] = None
+    exam: Optional[str] = None
+    subject_id: Optional[str] = None
+    subject_name: Optional[str] = None
+    subject_code: Optional[str] = None
+    marks: Optional[int] = None
+    total: Optional[int] = None
+    grade: Optional[str] = None
+    remarks: Optional[str] = None
+
+
+class ResultAdminIn(BaseModel):
+    """Admin single-result upsert. grade is computed server-side from marks/total."""
+    student_id: str
+    subject_id: str
+    exam_id: str
+    marks: int
+    total: int = 100
+    remarks: Optional[str] = None
 
 
 class ClassOut(BaseModel):
@@ -444,6 +588,40 @@ class SubjectIn(BaseModel):
 class SubjectUpdate(BaseModel):
     name: Optional[str] = None
     code: Optional[str] = None
+
+
+class CountScopeType(str, Enum):
+    class_ = "class"
+    student = "student"
+
+
+class CountMetric(str, Enum):
+    attendance_present = "attendance_present"
+    attendance_absent = "attendance_absent"
+    attendance_late = "attendance_late"
+    attendance_excused = "attendance_excused"
+    results_entry_count = "results_entry_count"
+    results_marks_sum = "results_marks_sum"
+    student_count = "student_count"
+
+
+class CountPeriodType(str, Enum):
+    month = "month"
+    exam = "exam"
+    current = "current"  # not time-scoped, e.g. student_count (a live roster size)
+
+
+class CountOut(BaseModel):
+    scope_type: CountScopeType = Field(description="'class' (a class's roster/attendance/results) or 'student' (one student's results)")
+    scope_id: str = Field(description="The class_id or student_id this row is about, per scope_type")
+    metric: CountMetric = Field(description="Which number this row holds - see the endpoint description for the full list")
+    period_type: CountPeriodType = Field(description="What period_key means: 'month', 'exam', or 'current' (not time-scoped)")
+    period_key: str = Field(description="'2026-07' for period_type=month, an exam_id for period_type=exam, or 'all' for period_type=current")
+    subject_id: Optional[str] = Field(None, description="A subject_id, or null for the all-subjects rollup row")
+    value: int = Field(description="The count/sum itself - e.g. a day count, an entry count, or a marks total")
+
+    class Config:
+        from_attributes = True
 
 
 class ExamStatus(str, Enum):

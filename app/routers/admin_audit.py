@@ -13,6 +13,71 @@ router = APIRouter(prefix="/admin")
 # control, and a plain admin/editor being able to read or clear it would defeat the point.
 AUDIT = Depends(oauth2.require_admin_permission("users"))
 
+# Which model backs each resource_type, for name resolution.
+_RESOURCE_MODEL = {
+    "user": models.User,
+    "teacher": models.Teacher,
+    "student": models.Student,
+    "exam": models.Exam,
+    "result": models.Result,
+}
+
+
+def _resolve_names(db: Session, rows: List[models.AuditLog]) -> List[schemas.AuditLogOut]:
+    """Attach human-readable actor/resource names to raw audit rows.
+
+    Audit rows store only ids (and the target may have since been deleted), so names are
+    resolved best-effort via batched per-type lookups. Anything that can't be resolved
+    (e.g. a deleted resource) falls back to None, and the client shows the raw id.
+    """
+    if not rows:
+        return []
+
+    # Actors are always admin-tier users.
+    actor_ids = {r.actor_id for r in rows}
+    actor_names = dict(
+        db.query(models.User.id, models.User.name).filter(models.User.id.in_(actor_ids)).all()
+    )
+
+    # Resource names, grouped by type so each table is queried once.
+    ids_by_type: dict[str, set] = {}
+    for r in rows:
+        ids_by_type.setdefault(r.resource_type, set()).add(r.resource_id)
+
+    resource_names: dict[tuple, str] = {}
+    for rtype, ids in ids_by_type.items():
+        model = _RESOURCE_MODEL.get(rtype)
+        if model is None:
+            continue
+        if rtype == "result":
+            # Results have no name column — describe them as "<student> · <exam>".
+            q = (
+                db.query(models.Result.id, models.Student.name, models.Result.exam)
+                .outerjoin(models.Student, models.Result.student_id == models.Student.id)
+                .filter(models.Result.id.in_(ids))
+            )
+            for rid, sname, exam in q.all():
+                label = " · ".join(p for p in (sname, exam) if p)
+                resource_names[("result", rid)] = label or None
+        else:
+            for rid, name in db.query(model.id, model.name).filter(model.id.in_(ids)).all():
+                resource_names[(rtype, rid)] = name
+
+    return [
+        schemas.AuditLogOut(
+            id=r.id,
+            created_at=r.created_at,
+            actor_id=r.actor_id,
+            actor_role=r.actor_role,
+            actor_name=actor_names.get(r.actor_id),
+            action=r.action,
+            resource_type=r.resource_type,
+            resource_id=r.resource_id,
+            resource_name=resource_names.get((r.resource_type, r.resource_id)),
+        )
+        for r in rows
+    ]
+
 
 @router.get(
     "/audit-log",
@@ -55,8 +120,8 @@ def list_audit_log(
     if created_to:
         query = query.filter(models.AuditLog.created_at <= created_to)
     total = query.count()
-    items = query.order_by(models.AuditLog.created_at.desc()).offset(offset).limit(limit).all()
-    return schemas.Page(items=items, total=total, limit=limit, offset=offset)
+    rows = query.order_by(models.AuditLog.created_at.desc()).offset(offset).limit(limit).all()
+    return schemas.Page(items=_resolve_names(db, rows), total=total, limit=limit, offset=offset)
 
 
 @router.get(
@@ -76,7 +141,7 @@ def get_audit_log_entry(entry_id: str, db: Session = Depends(get_db), _principal
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"error_code": "AUDIT_LOG_NOT_FOUND", "message": f"No audit log entry with id '{entry_id}'"},
         )
-    return row
+    return _resolve_names(db, [row])[0]
 
 
 @router.delete(

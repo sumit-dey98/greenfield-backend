@@ -135,6 +135,69 @@ def _check_schedule_conflicts(
 
 
 # ---------------------------------------------------------------------------
+# Counts (pre-aggregated attendance/results numbers)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/counts",
+    response_model=schemas.Page[schemas.CountOut],
+    tags=["admin-counts"],
+    summary="List pre-aggregated counts (attendance/results numbers)",
+    description=(
+        "Returns matching rows from the `counts` table - e.g. every class's "
+        "present/absent/late/excused for a given month, or every class's results entry_count/"
+        "marks_sum for a given exam. Kept in sync automatically whenever attendance is marked "
+        "or a result is entered/updated/deleted (admin or teacher endpoints), so this is always "
+        "current without re-fetching the underlying rows. `metric` values: `attendance_present`, "
+        "`attendance_absent`, `attendance_late`, `attendance_excused`, `results_entry_count`, "
+        "`results_marks_sum`, `student_count`. For results, `results_marks_sum / "
+        "results_entry_count` gives the average - it's not stored directly so it's never stale "
+        "relative to its inputs. `subject_id=null` rows are an all-subjects rollup for that "
+        "scope+exam. Paginated via `limit`/`offset` - always filter by at least `period_key` "
+        "or `scope_id` in practice, since an unfiltered call can span the whole table."
+    ),
+    responses={403: {"model": schemas.ErrorResponse, "description": "Role lacks 'academic' permission"}},
+)
+def list_counts(
+    scope_type: Optional[schemas.CountScopeType] = Query(
+        None, description="What the count is about: 'class' (a class's roster/attendance/results) or 'student' (one student's results)"
+    ),
+    scope_id: Optional[str] = Query(
+        None, description="The id of the class or student named by scope_type, e.g. a class_id like 'cls_01' or a student_id like 'std_01'"
+    ),
+    metric: Optional[schemas.CountMetric] = Query(None, description="Which number to fetch - see the metric list above"),
+    period_type: Optional[schemas.CountPeriodType] = Query(
+        None, description="What period_key means: 'month' (attendance), 'exam' (results), or 'current' (student_count, not time-scoped)"
+    ),
+    period_key: Optional[str] = Query(None, description="e.g. '2026-07' for period_type=month, an exam_id for period_type=exam, or 'all' for period_type=current"),
+    subject_id: Optional[str] = Query(
+        None, description="Restrict results metrics to one subject; omit for the all-subjects rollup row (subject_id=null in the response)"
+    ),
+    limit: int = Query(200, ge=1, le=2000, description="Max rows to return, 1-2000"),
+    offset: int = Query(0, ge=0, description="How many matching rows to skip, for paging past the first `limit`"),
+    db: Session = Depends(get_db),
+    _principal: dict = ACADEMIC,
+):
+    query = db.query(models.Count)
+    if scope_type:
+        query = query.filter(models.Count.scope_type == scope_type.value)
+    if scope_id:
+        query = query.filter(models.Count.scope_id == scope_id)
+    if metric:
+        query = query.filter(models.Count.metric == metric.value)
+    if period_type:
+        query = query.filter(models.Count.period_type == period_type.value)
+    if period_key:
+        query = query.filter(models.Count.period_key == period_key)
+    if subject_id:
+        query = query.filter(models.Count.subject_id == subject_id)
+    total = query.count()
+    items = query.offset(offset).limit(limit).all()
+    return schemas.Page(items=items, total=total, limit=limit, offset=offset)
+
+
+# ---------------------------------------------------------------------------
 # Classes
 # ---------------------------------------------------------------------------
 
@@ -927,5 +990,232 @@ def update_schedule_entry(
 )
 def delete_schedule_entry(schedule_id: str, db: Session = Depends(get_db), _principal: dict = ACADEMIC):
     row = _get_or_404(db, models.Schedule, schedule_id, "SCHEDULE_NOT_FOUND", "schedule entry")
+    db.delete(row)
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Attendance (admin, academic)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/attendance",
+    response_model=schemas.Page[schemas.AttendanceAdminOut],
+    tags=["admin-attendance"],
+    summary="List attendance records (admin)",
+    description="Filter by `class_id`, `student_id`, and/or a `date` range. Paginated via "
+    "`limit`/`offset` (limit up to 2000 for month-wide class views). Ordered most-recent first.",
+    responses={403: {"model": schemas.ErrorResponse, "description": "Role lacks 'academic' permission"}},
+)
+def list_admin_attendance(
+    class_id: Optional[str] = Query(None),
+    student_id: Optional[str] = Query(None),
+    from_date: Optional[date] = Query(None, description="Inclusive lower bound on date"),
+    to_date: Optional[date] = Query(None, description="Inclusive upper bound on date"),
+    limit: int = Query(200, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    _principal: dict = ACADEMIC,
+):
+    query = (
+        db.query(
+            models.Attendance,
+            models.Student.name.label("student_name"),
+            models.Student.class_id.label("class_id"),
+        )
+        .join(models.Student, models.Attendance.student_id == models.Student.id)
+    )
+    if class_id:
+        query = query.filter(models.Student.class_id == class_id)
+    if student_id:
+        query = query.filter(models.Attendance.student_id == student_id)
+    if from_date:
+        query = query.filter(models.Attendance.date >= from_date)
+    if to_date:
+        query = query.filter(models.Attendance.date <= to_date)
+
+    total = query.count()
+    rows = query.order_by(models.Attendance.date.desc()).offset(offset).limit(limit).all()
+    items = [
+        schemas.AttendanceAdminOut(
+            id=att.id, student_id=att.student_id, student_name=name, class_id=cid, date=att.date, status=att.status
+        )
+        for att, name, cid in rows
+    ]
+    return schemas.Page(items=items, total=total, limit=limit, offset=offset)
+
+
+@router.post(
+    "/attendance",
+    response_model=List[schemas.AttendanceOut],
+    tags=["admin-attendance"],
+    summary="Mark/update attendance for a set of students on a date (admin)",
+    description="Bulk insert-or-update: `{date, records:[{student_id, status}]}`. Re-submitting "
+    "for the same student + date updates the existing record. `status` must be one of: present, "
+    "absent, late, excused.",
+    responses={
+        403: {"model": schemas.ErrorResponse, "description": "Role lacks 'academic' permission"},
+        422: {"model": schemas.ValidationErrorResponse, "description": "Malformed request body"},
+    },
+)
+def mark_admin_attendance(
+    payload: schemas.AttendanceBulkIn,
+    db: Session = Depends(get_db),
+    _principal: dict = ACADEMIC,
+):
+    year_month = payload.date.isoformat()[:7]
+    saved: List[models.Attendance] = []
+    for record in payload.records:
+        student = db.query(models.Student).filter(models.Student.id == record.student_id).first()
+
+        row_id = f"att_{record.student_id}_{payload.date.isoformat()}"
+        row = db.query(models.Attendance).filter(models.Attendance.id == row_id).first()
+        old_status = row.status if row else None
+        if row:
+            row.status = record.status
+        else:
+            row = models.Attendance(
+                id=row_id, student_id=record.student_id, date=payload.date, status=record.status
+            )
+            db.add(row)
+        # Skip the count update (not the save) if the student has no class to attribute it to.
+        if student and student.class_id:
+            utils.apply_attendance_count_delta(db, student.class_id, year_month, old_status, record.status)
+        saved.append(row)
+    db.commit()
+    return saved
+
+
+# ---------------------------------------------------------------------------
+# Results (admin, academic)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/results",
+    response_model=schemas.Page[schemas.ResultAdminOut],
+    tags=["admin-results"],
+    summary="List results (admin)",
+    description="Filter by `class_id`, `student_id`, `subject_id`, and/or `exam_id`. Includes "
+    "joined subject and student names. Paginated via `limit`/`offset` (up to 2000).",
+    responses={403: {"model": schemas.ErrorResponse, "description": "Role lacks 'academic' permission"}},
+)
+def list_admin_results(
+    class_id: Optional[str] = Query(None),
+    student_id: Optional[str] = Query(None),
+    subject_id: Optional[str] = Query(None),
+    exam_id: Optional[str] = Query(None),
+    limit: int = Query(200, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    _principal: dict = ACADEMIC,
+):
+    query = (
+        db.query(
+            models.Result,
+            models.Student.name.label("student_name"),
+            models.Student.class_id.label("class_id"),
+            models.Subject.name.label("subject_name"),
+            models.Subject.code.label("subject_code"),
+        )
+        .join(models.Student, models.Result.student_id == models.Student.id)
+        .outerjoin(models.Subject, models.Result.subject_id == models.Subject.id)
+    )
+    if class_id:
+        query = query.filter(models.Student.class_id == class_id)
+    if student_id:
+        query = query.filter(models.Result.student_id == student_id)
+    if subject_id:
+        query = query.filter(models.Result.subject_id == subject_id)
+    if exam_id:
+        query = query.filter(models.Result.exam_id == exam_id)
+
+    total = query.count()
+    rows = query.order_by(models.Result.student_id).offset(offset).limit(limit).all()
+    items = [
+        schemas.ResultAdminOut(
+            id=r.id, student_id=r.student_id, student_name=sname, class_id=cid,
+            exam_id=r.exam_id, exam=r.exam, subject_id=r.subject_id,
+            subject_name=subj_name, subject_code=subj_code,
+            marks=r.marks, total=r.total, grade=r.grade, remarks=r.remarks,
+        )
+        for r, sname, cid, subj_name, subj_code in rows
+    ]
+    return schemas.Page(items=items, total=total, limit=limit, offset=offset)
+
+
+@router.post(
+    "/results",
+    response_model=schemas.ResultOut,
+    tags=["admin-results"],
+    summary="Create or update one result (admin)",
+    description="Upsert by (student, subject, exam). `grade` is computed server-side from "
+    "marks/total. Re-submitting for the same student+subject+exam updates the existing record.",
+    responses={
+        403: {"model": schemas.ErrorResponse, "description": "Role lacks 'academic' permission"},
+        404: {"model": schemas.ErrorResponse, "description": "exam_id or subject_id doesn't exist"},
+        422: {"model": schemas.ValidationErrorResponse, "description": "Malformed body, or marks > total"},
+    },
+)
+def upsert_admin_result(
+    payload: schemas.ResultAdminIn,
+    db: Session = Depends(get_db),
+    _principal: dict = ACADEMIC,
+):
+    exam = _get_or_404(db, models.Exam, payload.exam_id, "EXAM_NOT_FOUND", "exam")
+    subject = _get_or_404(db, models.Subject, payload.subject_id, "SUBJECT_NOT_FOUND", "subject")
+    student = _get_or_404(db, models.Student, payload.student_id, "STUDENT_NOT_FOUND", "student")
+    if payload.marks > payload.total:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error_code": "INVALID_MARKS", "message": "marks cannot exceed total"},
+        )
+    computed_grade = utils.compute_grade(payload.marks, payload.total)
+    row_id = f"res_{payload.student_id}_{payload.exam_id}_{payload.subject_id}"
+    row = db.query(models.Result).filter(models.Result.id == row_id).first()
+    old_marks = row.marks if row else None
+    if row:
+        row.marks = payload.marks
+        row.total = payload.total
+        row.grade = computed_grade
+        row.remarks = payload.remarks
+    else:
+        row = models.Result(
+            id=row_id, student_id=payload.student_id, subject_id=payload.subject_id,
+            exam=exam.name, exam_id=payload.exam_id, marks=payload.marks, total=payload.total,
+            grade=computed_grade, remarks=payload.remarks,
+        )
+        db.add(row)
+    if student.class_id:
+        utils.apply_result_count_delta(
+            db, student.class_id, payload.student_id, payload.subject_id, payload.exam_id,
+            old_marks, payload.marks,
+        )
+    db.commit()
+    return schemas.ResultOut(
+        id=row.id, exam_id=row.exam_id, exam=row.exam, subject_id=row.subject_id,
+        subject_name=subject.name, subject_code=subject.code, marks=row.marks,
+        total=row.total, grade=row.grade, remarks=row.remarks,
+    )
+
+
+@router.delete(
+    "/results/{result_id}",
+    tags=["admin-results"],
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete a result (admin)",
+    responses={
+        403: {"model": schemas.ErrorResponse, "description": "Role lacks 'academic' permission"},
+        404: {"model": schemas.ErrorResponse, "description": "No result with that id"},
+    },
+)
+def delete_admin_result(result_id: str, db: Session = Depends(get_db), _principal: dict = ACADEMIC):
+    row = _get_or_404(db, models.Result, result_id, "RESULT_NOT_FOUND", "result")
+    student = db.query(models.Student).filter(models.Student.id == row.student_id).first()
+    if student and student.class_id:
+        utils.apply_result_count_delta(
+            db, student.class_id, row.student_id, row.subject_id, row.exam_id, row.marks, None,
+        )
     db.delete(row)
     db.commit()

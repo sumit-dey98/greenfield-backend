@@ -1,0 +1,18 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Values are interpolated from ./.env — nothing hardcoded here.
+      # DATABASE_URL_DOCKER points at the host's existing Postgres via host.docker.internal.
+      - DATABASE_URL=${DATABASE_URL_DOCKER}
+      - SECRET_KEY=${SECRET_KEY}
+    extra_hosts:
+      # Makes host.docker.internal resolve to the host on Linux (no-op on Docker Desktop).
+      - "host.docker.internal:host-gateway"
+
+# NOTE: No `db` service here on purpose — the schema and seed data already live in the
+# host's local Postgres. If you ever want a self-contained throwaway database, add a
+# `postgres:16` service, point DATABASE_URL_DOCKER at it (@db:5432), and bootstrap the
+# schema (Base.metadata.create_all -> alembic stamp head -> load data.sql) before first use.
