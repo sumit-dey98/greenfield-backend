@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from .config import settings
 from .database import get_db
 from .routers import admin, admin_academic, admin_audit, admin_cms, admin_people, auth, public, students, teachers
 
@@ -170,7 +171,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict to your frontend origin(s) in production
+    allow_origins=settings.cors_origins_list,
     allow_methods=["*"],
     allow_headers=["*"],
 )
