@@ -31,13 +31,27 @@ def _find_account(db: Session, email: str):
     responses={
         401: {
             "model": schemas.ErrorResponse,
-            "description": "Email not found, or password incorrect, or account has no password set yet",
+            "description": "Email not found, or password incorrect",
+        },
+        403: {
+            "model": schemas.ErrorResponse,
+            "description": "Account exists but has no password set yet (PASSWORD_NOT_SET) — "
+            "the user should set one via POST /auth/set-password",
         },
         422: {"model": schemas.ValidationErrorResponse, "description": "Malformed request body"},
     },
 )
 def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)):
     account, user_type, role = _find_account(db, payload.email)
+    # Account exists but has no password yet -> tell the frontend to show the "set password" form.
+    if account and not account.password_hash:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error_code": "PASSWORD_NOT_SET",
+                "message": "This account has no password yet. Please set one to continue.",
+            },
+        )
     if (
         not account
         or not account.password_hash
@@ -57,6 +71,116 @@ def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)):
         user_type=user_type,
         role=role,
     )
+
+
+@router.post(
+    "/set-password",
+    response_model=schemas.Token,
+    summary="Set the password for an account that has none yet (self-service first-time setup)",
+    description=(
+        "For students/teachers (and any account) whose password is null — either never set, or "
+        "cleared by an admin as a reset. Sets the password and logs the user in (returns a token "
+        "pair). Fails with 409 if the account already has a password (use the admin clear-password "
+        "reset flow instead) or 404 if no account matches the email."
+    ),
+    responses={
+        404: {"model": schemas.ErrorResponse, "description": "No account with that email"},
+        409: {
+            "model": schemas.ErrorResponse,
+            "description": "Account already has a password (PASSWORD_ALREADY_SET)",
+        },
+        422: {"model": schemas.ValidationErrorResponse, "description": "Malformed request body"},
+    },
+)
+def set_password(payload: schemas.SetInitialPasswordRequest, db: Session = Depends(get_db)):
+    account, user_type, role = _find_account(db, payload.email)
+    if not account:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_code": "USER_NOT_FOUND", "message": "No account with that email"},
+        )
+    if account.password_hash:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error_code": "PASSWORD_ALREADY_SET",
+                "message": "This account already has a password. Ask an admin to reset it first.",
+            },
+        )
+    account.password_hash = utils.hash_password(payload.new_password)
+    db.commit()
+    assert user_type is not None and role is not None
+
+    return schemas.Token(
+        access_token=oauth2.create_access_token(account.id, user_type, role),
+        refresh_token=oauth2.create_refresh_token(account.id, user_type, role),
+        user_type=user_type,
+        role=role,
+    )
+
+
+@router.post(
+    "/request-password-reset",
+    response_model=schemas.PasswordResetRequestOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="Request an admin-driven password reset (public)",
+    description=(
+        "A student or teacher who forgot their password submits `{role, email}`. `role` "
+        "(student|teacher) tells the backend which table to verify the email against. The "
+        "request lands in an admin queue; an admin then accepts it, which clears the password "
+        "so the user can set a new one at login.\n\n"
+        "Anti-spam: the email must exist in the matching table (404 otherwise), and only one "
+        "**active** request may exist per email+role at a time (409 if one is already open)."
+    ),
+    responses={
+        201: {"description": "Request recorded"},
+        404: {"model": schemas.ErrorResponse, "description": "No student/teacher with that email for the given role"},
+        409: {
+            "model": schemas.ErrorResponse,
+            "description": "An active reset request already exists for this email+role (RESET_REQUEST_EXISTS)",
+        },
+        422: {"model": schemas.ValidationErrorResponse, "description": "Malformed request body"},
+    },
+)
+def request_password_reset(payload: schemas.PasswordResetRequestIn, db: Session = Depends(get_db)):
+    email = payload.email.strip().lower()
+    role = payload.role.value
+
+    model = models.Student if role == "student" else models.Teacher
+    account = db.query(model).filter(model.email == email).first()
+    if not account:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error_code": f"{role.upper()}_NOT_FOUND",
+                "message": f"No {role} account with that email",
+            },
+        )
+
+    # Anti-spam: block duplicate open requests for the same person.
+    existing = (
+        db.query(models.PasswordResetRequest)
+        .filter(
+            models.PasswordResetRequest.email == email,
+            models.PasswordResetRequest.role == role,
+            models.PasswordResetRequest.is_active.is_(True),
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error_code": "RESET_REQUEST_EXISTS",
+                "message": "A password reset request is already pending for this account.",
+            },
+        )
+
+    row = models.PasswordResetRequest(email=email, role=role, status="pending", is_active=True)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return row
 
 
 @router.post(

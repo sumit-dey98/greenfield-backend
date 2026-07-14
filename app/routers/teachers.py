@@ -43,6 +43,30 @@ def my_profile(
     return db.query(models.Teacher).filter(models.Teacher.id == principal["id"]).first()
 
 
+@router.put(
+    "/me",
+    response_model=schemas.TeacherOut,
+    summary="Update the logged-in teacher's own editable profile fields",
+    description="A teacher may edit their own phone, avatar, message, and bio. "
+    "Email/subject/role are admin-managed and not editable here.",
+    responses={
+        401: {"model": schemas.ErrorResponse, "description": "Missing/invalid/expired access token"},
+        403: {"model": schemas.ErrorResponse, "description": "Token is valid but not a teacher account"},
+    },
+)
+def update_my_profile(
+    payload: schemas.TeacherSelfUpdate,
+    principal: dict = Depends(oauth2.require_user_type("teacher")),
+    db: Session = Depends(get_db),
+):
+    teacher = db.query(models.Teacher).filter(models.Teacher.id == principal["id"]).first()
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(teacher, field, value)
+    db.commit()
+    db.refresh(teacher)
+    return teacher
+
+
 @router.get(
     "/me/class",
     response_model=schemas.ClassRosterOut,
@@ -67,6 +91,79 @@ def my_class(
         query = query.filter(models.Student.name.ilike(f"%{name.strip()}%"))
     students = query.order_by(models.Student.roll).all()
     return schemas.ClassRosterOut(class_info=cls, students=students)
+
+
+@router.get(
+    "/me/classes/{class_id}/students",
+    response_model=List[schemas.StudentOut],
+    summary="Get the student roster of any class this teacher teaches",
+    description="Returns the students of a class the teacher is scheduled to teach — not "
+    "just their homeroom class — ordered by roll. Authorized via the `schedule` table. "
+    "Optionally filter by `name` (partial, case-insensitive). Used for grade entry across "
+    "all taught classes.",
+    responses={
+        401: {"model": schemas.ErrorResponse, "description": "Missing/invalid/expired access token"},
+        403: {"model": schemas.ErrorResponse, "description": "Not a teacher account, or the teacher doesn't teach this class"},
+        404: {"model": schemas.ErrorResponse, "description": "No class with that id"},
+    },
+)
+def my_taught_class_students(
+    class_id: str,
+    name: Optional[str] = Query(None, description="Partial, case-insensitive match on student name"),
+    principal: dict = Depends(oauth2.require_user_type("teacher")),
+    db: Session = Depends(get_db),
+):
+    cls = db.query(models.Class).filter(models.Class.id == class_id).first()
+    if not cls:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_code": "CLASS_NOT_FOUND", "message": f"No class with id '{class_id}'"},
+        )
+
+    teaches_it = (
+        db.query(models.Schedule)
+        .filter(
+            models.Schedule.teacher_id == principal["id"],
+            models.Schedule.class_id == class_id,
+        )
+        .first()
+    )
+    if not teaches_it:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error_code": "NOT_SCHEDULED_FOR_CLASS",
+                "message": "You are not scheduled to teach this class",
+            },
+        )
+
+    query = db.query(models.Student).filter(models.Student.class_id == class_id)
+    if name:
+        query = query.filter(models.Student.name.ilike(f"%{name.strip()}%"))
+    return query.order_by(models.Student.roll).all()
+
+
+@router.get(
+    "/me/exams",
+    response_model=List[schemas.ExamOut],
+    summary="List exams (read-only, for grade entry)",
+    description="Read-only list of all exams so a teacher can pick which exam to grade and "
+    "see its status (upcoming/ongoing/grading/ended). Optionally filter by `status`. "
+    "Ordered by start_date.",
+    responses={
+        401: {"model": schemas.ErrorResponse, "description": "Missing/invalid/expired access token"},
+        403: {"model": schemas.ErrorResponse, "description": "Token is valid but not a teacher account"},
+    },
+)
+def my_exams(
+    status_filter: Optional[schemas.ExamStatus] = Query(None, alias="status", description="Filter by exam status"),
+    principal: dict = Depends(oauth2.require_user_type("teacher")),
+    db: Session = Depends(get_db),
+):
+    query = db.query(models.Exam)
+    if status_filter:
+        query = query.filter(models.Exam.status == status_filter)
+    return query.order_by(models.Exam.start_date).all()
 
 
 @router.get(
@@ -217,6 +314,7 @@ def mark_attendance(
         s.id for s in db.query(models.Student.id).filter(models.Student.class_id == cls.id).all()
     }
 
+    year_month = payload.date.isoformat()[:7]
     saved: List[models.Attendance] = []
     for record in payload.records:
         if record.student_id not in roster_ids:
@@ -230,6 +328,7 @@ def mark_attendance(
 
         row_id = f"att_{record.student_id}_{payload.date.isoformat()}"
         row = db.query(models.Attendance).filter(models.Attendance.id == row_id).first()
+        old_status = row.status if row else None
         if row:
             row.status = record.status
         else:
@@ -237,6 +336,7 @@ def mark_attendance(
                 id=row_id, student_id=record.student_id, date=payload.date, status=record.status
             )
             db.add(row)
+        utils.apply_attendance_count_delta(db, cls.id, year_month, old_status, record.status)
         saved.append(row)
 
     db.commit()
@@ -409,6 +509,7 @@ def enter_results(
         row_id = f"res_{record.student_id}_{payload.exam_id}_{payload.subject_id}"
         computed_grade = utils.compute_grade(record.marks, record.total)
         row = db.query(models.Result).filter(models.Result.id == row_id).first()
+        old_marks = row.marks if row else None
         if row:
             row.marks = record.marks
             row.total = record.total
@@ -429,6 +530,10 @@ def enter_results(
             )
             db.add(row)
             utils.log_audit(db, principal["id"], principal["role"], "create", "result", row_id)
+        utils.apply_result_count_delta(
+            db, payload.class_id, record.student_id, payload.subject_id, payload.exam_id,
+            old_marks, record.marks,
+        )
         saved.append(row)
 
     db.commit()

@@ -152,6 +152,18 @@ def list_public_testimonials(
 
 
 @router.get(
+    "/faculty",
+    response_model=List[schemas.FacultyOut],
+    summary="List faculty/staff for the public site",
+    description="Public, no auth required. Returns the school's teaching and leadership staff "
+    "for the public faculty page, ordered by join date. Exposes only public-facing fields "
+    "(name, role, subject, avatar, contact, bio/message) — never passwords or internal data.",
+)
+def list_public_faculty(db: Session = Depends(get_db)):
+    return db.query(models.Teacher).order_by(models.Teacher.join_date).all()
+
+
+@router.get(
     "/admission-status",
     response_model=schemas.AdmissionStatusOut,
     summary="Check whether admissions are currently open",

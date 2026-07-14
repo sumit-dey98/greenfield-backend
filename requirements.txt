@@ -6,5 +6,6 @@ alembic
 python-jose[cryptography]
 bcrypt
 pydantic-settings
+pydantic[email]
 python-multipart
 python-dotenv

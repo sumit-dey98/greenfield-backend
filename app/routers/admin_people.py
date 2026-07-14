@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -186,7 +187,7 @@ def create_student(payload: schemas.StudentIn, db: Session = Depends(get_db), pr
         id=row_id,
         name=payload.name,
         email=payload.email,
-        password_hash=utils.hash_password(payload.password),
+        password_hash=utils.hash_password(payload.password) if payload.password else None,
         role="student",
         roll=payload.roll,
         class_id=payload.class_id,
@@ -200,6 +201,8 @@ def create_student(payload: schemas.StudentIn, db: Session = Depends(get_db), pr
     )
     db.add(row)
     utils.log_audit(db, principal["id"], principal["role"], "create", "student", row_id)
+    if payload.class_id:
+        utils.apply_student_count_delta(db, None, payload.class_id)
     db.commit()
     return _student_out(row, cls.name if cls else None)
 
@@ -230,9 +233,12 @@ def update_student(
     if "class_id" in fields and fields["class_id"]:
         _get_or_404(db, models.Class, fields["class_id"], "CLASS_NOT_FOUND", "class")
 
+    old_class_id = row.class_id
     for field, value in fields.items():
         setattr(row, field, value)
     utils.log_audit(db, principal["id"], principal["role"], "update", "student", student_id)
+    if "class_id" in fields:
+        utils.apply_student_count_delta(db, old_class_id, row.class_id)
     db.commit()
 
     class_name = None
@@ -256,30 +262,33 @@ def update_student(
 )
 def delete_student(student_id: str, db: Session = Depends(get_db), principal: dict = ACADEMIC):
     row = _get_or_404(db, models.Student, student_id, "STUDENT_NOT_FOUND", "student")
+    if row.class_id:
+        utils.apply_student_count_delta(db, row.class_id, None)
     db.delete(row)
     utils.log_audit(db, principal["id"], principal["role"], "delete", "student", student_id)
     db.commit()
 
 
 @router.post(
-    "/students/{student_id}/set-password",
+    "/students/{student_id}/clear-password",
     status_code=status.HTTP_204_NO_CONTENT,
     tags=["admin-students"],
-    summary="Set or reset a student's password",
+    summary="Clear (reset) a student's password",
+    description="Sets the student's password to null. Admins cannot set a password directly — "
+    "clearing it lets the student set their own password at the login screen. This is the "
+    "password-reset flow: a student who forgot their password asks an admin to clear it.",
     responses={
         403: {"model": schemas.ErrorResponse, "description": "Role lacks 'academic' permission"},
         404: {"model": schemas.ErrorResponse, "description": "No student with that id"},
-        422: {"model": schemas.ValidationErrorResponse, "description": "Malformed request body"},
     },
 )
-def set_student_password(
+def clear_student_password(
     student_id: str,
-    payload: schemas.PasswordChangeIn,
     db: Session = Depends(get_db),
     principal: dict = ACADEMIC,
 ):
     row = _get_or_404(db, models.Student, student_id, "STUDENT_NOT_FOUND", "student")
-    row.password_hash = utils.hash_password(payload.new_password)
+    row.password_hash = None
     utils.log_audit(db, principal["id"], principal["role"], "set_password", "student", student_id)
     db.commit()
 
@@ -382,9 +391,11 @@ def create_teacher(payload: schemas.TeacherIn, db: Session = Depends(get_db), pr
         id=row_id,
         name=payload.name,
         email=payload.email,
-        password_hash=utils.hash_password(payload.password),
+        password_hash=utils.hash_password(payload.password) if payload.password else None,
         role=payload.role,
         subject_id=payload.subject_id,
+        # keep the denormalized `subject` name column in sync (read by /faculty, /teachers/me)
+        subject=subj.name if subj else None,
         phone=payload.phone,
         join_date=payload.join_date,
         avatar=payload.avatar,
@@ -426,6 +437,14 @@ def update_teacher(
 
     for field, value in fields.items():
         setattr(row, field, value)
+    # keep the denormalized `subject` name column in sync with subject_id
+    if "subject_id" in fields:
+        subj = (
+            db.query(models.Subject).filter(models.Subject.id == fields["subject_id"]).first()
+            if fields["subject_id"]
+            else None
+        )
+        row.subject = subj.name if subj else None
     utils.log_audit(db, principal["id"], principal["role"], "update", "teacher", teacher_id)
     db.commit()
 
@@ -477,23 +496,120 @@ def delete_teacher(teacher_id: str, db: Session = Depends(get_db), principal: di
 
 
 @router.post(
-    "/teachers/{teacher_id}/set-password",
+    "/teachers/{teacher_id}/clear-password",
     status_code=status.HTTP_204_NO_CONTENT,
     tags=["admin-teachers"],
-    summary="Set or reset a teacher's password",
+    summary="Clear (reset) a teacher's password",
+    description="Sets the teacher's password to null. Admins cannot set a password directly — "
+    "clearing it lets the teacher set their own password at the login screen. This is the "
+    "password-reset flow: a teacher who forgot their password asks an admin to clear it.",
     responses={
         403: {"model": schemas.ErrorResponse, "description": "Role lacks 'academic' permission"},
         404: {"model": schemas.ErrorResponse, "description": "No teacher with that id"},
-        422: {"model": schemas.ValidationErrorResponse, "description": "Malformed request body"},
     },
 )
-def set_teacher_password(
+def clear_teacher_password(
     teacher_id: str,
-    payload: schemas.PasswordChangeIn,
     db: Session = Depends(get_db),
     principal: dict = ACADEMIC,
 ):
     row = _get_or_404(db, models.Teacher, teacher_id, "TEACHER_NOT_FOUND", "teacher")
-    row.password_hash = utils.hash_password(payload.new_password)
+    row.password_hash = None
     utils.log_audit(db, principal["id"], principal["role"], "set_password", "teacher", teacher_id)
     db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Password reset requests (admin queue)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/password-reset-requests",
+    response_model=schemas.Page[schemas.PasswordResetRequestOut],
+    tags=["admin-password-resets"],
+    summary="List password reset requests",
+    description="The admin queue of student/teacher password-reset requests. Filter by "
+    "`role`, `status`, `active` (is_active), a `created_at` date range, and/or `email` "
+    "(partial, case-insensitive). Paginated via `limit`/`offset`. Ordered most-recent first.",
+    responses={403: {"model": schemas.ErrorResponse, "description": "Role lacks 'academic' permission"}},
+)
+def list_password_reset_requests(
+    role: Optional[schemas.ResetRole] = Query(None, description="student or teacher"),
+    status_filter: Optional[schemas.ResetStatus] = Query(None, alias="status", description="pending or accepted"),
+    active: Optional[bool] = Query(None, description="Filter by is_active"),
+    email: Optional[str] = Query(None, description="Partial, case-insensitive match on email"),
+    created_from: Optional[datetime] = Query(None, description="Inclusive lower bound on created_at"),
+    created_to: Optional[datetime] = Query(None, description="Inclusive upper bound on created_at"),
+    limit: int = Query(20, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    _principal: dict = ACADEMIC,
+):
+    query = db.query(models.PasswordResetRequest)
+    if role:
+        query = query.filter(models.PasswordResetRequest.role == role.value)
+    if status_filter:
+        query = query.filter(models.PasswordResetRequest.status == status_filter.value)
+    if active is not None:
+        query = query.filter(models.PasswordResetRequest.is_active.is_(active))
+    if email:
+        query = query.filter(models.PasswordResetRequest.email.ilike(f"%{email.strip()}%"))
+    if created_from:
+        query = query.filter(models.PasswordResetRequest.created_at >= created_from)
+    if created_to:
+        query = query.filter(models.PasswordResetRequest.created_at <= created_to)
+
+    total = query.count()
+    rows = (
+        query.order_by(models.PasswordResetRequest.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    return schemas.Page(items=rows, total=total, limit=limit, offset=offset)
+
+
+@router.post(
+    "/password-reset-requests/{request_id}/accept",
+    response_model=schemas.PasswordResetRequestOut,
+    tags=["admin-password-resets"],
+    summary="Accept a password reset request",
+    description="Clears the target student/teacher's password (so they can set a new one at "
+    "login), marks the request `accepted`, and sets `is_active` to false (dropping it from the "
+    "active queue). Idempotent-safe: a request that's already inactive returns 409.",
+    responses={
+        403: {"model": schemas.ErrorResponse, "description": "Role lacks 'academic' permission"},
+        404: {"model": schemas.ErrorResponse, "description": "No reset request with that id"},
+        409: {"model": schemas.ErrorResponse, "description": "Request is already resolved (ALREADY_RESOLVED)"},
+    },
+)
+def accept_password_reset_request(
+    request_id: int,
+    db: Session = Depends(get_db),
+    principal: dict = ACADEMIC,
+):
+    req = db.query(models.PasswordResetRequest).filter(models.PasswordResetRequest.id == request_id).first()
+    if not req:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_code": "RESET_REQUEST_NOT_FOUND", "message": f"No reset request with id '{request_id}'"},
+        )
+    if not req.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"error_code": "ALREADY_RESOLVED", "message": "This request has already been resolved."},
+        )
+
+    # Clear the target account's password so they can set a new one at login.
+    model = models.Student if req.role == "student" else models.Teacher
+    account = db.query(model).filter(model.email == req.email).first()
+    if account:
+        account.password_hash = None
+        utils.log_audit(db, principal["id"], principal["role"], "set_password", req.role, account.id)
+
+    req.status = "accepted"
+    req.is_active = False
+    db.commit()
+    db.refresh(req)
+    return req

@@ -24,11 +24,11 @@ class Teacher(Base):
     password_hash: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     role: Mapped[Optional[str]] = mapped_column(String)
     subject: Mapped[Optional[str]] = mapped_column(String)
-    class_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("classes.id", ondelete="SET NULL"))
+    class_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("classes.id", ondelete="SET NULL"), index=True)
     phone: Mapped[Optional[str]] = mapped_column(String)
     join_date: Mapped[Optional[date]] = mapped_column(Date)
     avatar: Mapped[Optional[str]] = mapped_column(String)
-    subject_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("subjects.id"))
+    subject_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("subjects.id"), index=True)
     message: Mapped[Optional[str]] = mapped_column(Text)
     bio: Mapped[Optional[str]] = mapped_column(Text)
 
@@ -40,7 +40,7 @@ class Class(Base):
     grade: Mapped[Optional[int]] = mapped_column(Integer)
     section: Mapped[Optional[str]] = mapped_column(String)
     room: Mapped[Optional[str]] = mapped_column(String)
-    teacher_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("teachers.id"))
+    teacher_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("teachers.id"), index=True)
 
 
 class Student(Base):
@@ -51,7 +51,7 @@ class Student(Base):
     password_hash: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     role: Mapped[Optional[str]] = mapped_column(String)
     roll: Mapped[Optional[int]] = mapped_column(Integer)
-    class_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("classes.id", ondelete="SET NULL"))
+    class_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("classes.id", ondelete="SET NULL"), index=True)
     gender: Mapped[Optional[str]] = mapped_column(String)
     dob: Mapped[Optional[date]] = mapped_column(Date)
     phone: Mapped[Optional[str]] = mapped_column(String)
@@ -120,30 +120,30 @@ class Notice(Base):
 class Result(Base):
     __tablename__ = "results"
     id: Mapped[str] = mapped_column(String, primary_key=True)
-    student_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("students.id", ondelete="CASCADE"))
-    subject_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("subjects.id"))
+    student_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("students.id", ondelete="CASCADE"), index=True)
+    subject_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("subjects.id"), index=True)
     exam: Mapped[Optional[str]] = mapped_column(String)
     marks: Mapped[Optional[int]] = mapped_column(Integer)
     total: Mapped[Optional[int]] = mapped_column(Integer)
     grade: Mapped[Optional[str]] = mapped_column(String)
     remarks: Mapped[Optional[str]] = mapped_column(String)
-    exam_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("exams.id"))
+    exam_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("exams.id"), index=True)
 
 
 class Attendance(Base):
     __tablename__ = "attendance"
     id: Mapped[str] = mapped_column(String, primary_key=True)
-    student_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("students.id", ondelete="CASCADE"))
-    date: Mapped[Optional[date]] = mapped_column(Date)
+    student_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("students.id", ondelete="CASCADE"), index=True)
+    date: Mapped[Optional[date]] = mapped_column(Date, index=True)
     status: Mapped[Optional[str]] = mapped_column(String)
 
 
 class Schedule(Base):
     __tablename__ = "schedule"
     id: Mapped[str] = mapped_column(String, primary_key=True)
-    class_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("classes.id"))
+    class_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("classes.id"), index=True)
     subject_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("subjects.id"))
-    teacher_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("teachers.id"))
+    teacher_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("teachers.id"), index=True)
     day: Mapped[Optional[str]] = mapped_column(String)
     start_time: Mapped[Optional[str]] = mapped_column(String)
     end_time: Mapped[Optional[str]] = mapped_column(String)
@@ -191,3 +191,38 @@ class User(Base):
     role: Mapped[str] = mapped_column(String, nullable=False, default="admin")
     address: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PasswordResetRequest(Base):
+    """A student/teacher's request for an admin to reset (clear) their password.
+    `email` refers to a row in students or teachers depending on `role`."""
+
+    __tablename__ = "password_reset_requests"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String, nullable=False)  # student | teacher
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")  # pending | accepted
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Count(Base):
+    """A single pre-aggregated number, kept in sync with its source rows on every write
+    (see utils.bump_count). One row per (scope, metric, period[, subject]) - e.g. how many
+    students in class 'cls_9a' were present in "2026-07", or the sum of marks + entry count
+    for class 'cls_9a' in exam 'exam_1' subject 'sub_math' (subject_id NULL = all-subjects
+    rollup for that scope+exam). `id` is a deterministic composite key so an upsert can target
+    a row by primary key without a separate lookup query."""
+
+    __tablename__ = "counts"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    scope_type: Mapped[str] = mapped_column(String, nullable=False, index=True)  # class | student
+    scope_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    metric: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    # attendance_present | attendance_absent | attendance_late | attendance_excused |
+    # results_entry_count | results_marks_sum
+    period_type: Mapped[str] = mapped_column(String, nullable=False)  # month | exam
+    period_key: Mapped[str] = mapped_column(String, nullable=False, index=True)  # "2026-07" or an exam_id
+    subject_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # NULL = all-subjects rollup
+    value: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
