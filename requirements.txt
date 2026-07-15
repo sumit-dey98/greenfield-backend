@@ -10,3 +10,5 @@ pydantic-settings==2.14.2
 pydantic[email]==2.13.4
 python-multipart==0.0.32
 python-dotenv==1.2.2
+cloudinary==1.44.1
+reportlab==4.2.5

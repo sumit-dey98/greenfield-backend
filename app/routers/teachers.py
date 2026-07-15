@@ -11,6 +11,12 @@ from ..utils import normalize_day
 
 router = APIRouter(prefix="/teachers", tags=["teachers"])
 
+# ---------------------------------------------------------------------------
+# Admission grading (blind) - see schemas.ApplicationGradingOut. Never expose student_name,
+# contact_*, guardian_*, address, or any other applicant-identifying field from this section,
+# even internally beyond what's needed to compute the blind response fields.
+# ---------------------------------------------------------------------------
+
 
 def _get_homeroom_class(db: Session, teacher_id: str) -> models.Class:
     """A teacher's homeroom class is the row in `classes` where teacher_id points back to them."""
@@ -551,3 +557,160 @@ def enter_results(
         )
         for r in saved
     ]
+
+
+@router.get(
+    "/me/admission-grading",
+    response_model=schemas.Page[schemas.ApplicationGradingOut],
+    summary="List admission-exam papers assigned to the logged-in teacher for blind grading",
+    description=(
+        "BLIND: only `roll_number`, `applying_class`, `exam_date`, and grading status/marks are "
+        "returned - never the applicant's name, contact details, guardian info, or address. "
+        "Scoped to grading assignments where you are the assigned teacher."
+    ),
+    responses={
+        401: {"model": schemas.ErrorResponse, "description": "Missing/invalid/expired access token"},
+        403: {"model": schemas.ErrorResponse, "description": "Token is valid but not a teacher account"},
+    },
+)
+def my_admission_grading(
+    limit: int = Query(20, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    principal: dict = Depends(oauth2.require_user_type("teacher")),
+    db: Session = Depends(get_db),
+):
+    query = (
+        db.query(
+            models.ApplicationGradingAssignment,
+            models.Application.applying_class,
+            models.ApplicationExamSchedule.roll_number,
+            models.ApplicationExamSchedule.exam_date,
+            models.ApplicationExamResult.marks,
+            models.ApplicationExamResult.total,
+        )
+        .join(models.Application, models.ApplicationGradingAssignment.application_id == models.Application.id)
+        .outerjoin(
+            models.ApplicationExamSchedule,
+            models.ApplicationExamSchedule.application_id == models.Application.id,
+        )
+        .outerjoin(
+            models.ApplicationExamResult,
+            models.ApplicationExamResult.application_id == models.Application.id,
+        )
+        .filter(models.ApplicationGradingAssignment.teacher_id == principal["id"])
+    )
+    total = query.count()
+    rows = query.offset(offset).limit(limit).all()
+    items = [
+        schemas.ApplicationGradingOut(
+            application_id=assignment.application_id,
+            roll_number=roll_number or "",
+            applying_class=applying_class,
+            exam_date=exam_date,
+            status=assignment.status,
+            marks=marks,
+            total=total_marks,
+        )
+        for assignment, applying_class, roll_number, exam_date, marks, total_marks in rows
+    ]
+    return schemas.Page(items=items, total=total, limit=limit, offset=offset)
+
+
+@router.post(
+    "/me/admission-grading/{application_id}/result",
+    response_model=schemas.ApplicationGradingOut,
+    summary="Submit an entrance-exam grading result (blind)",
+    description=(
+        "Only usable if you are the teacher assigned to grade this application - 403 otherwise. "
+        "Upserts the exam result, sets the application's `entrance_score`/`status='graded'`, and "
+        "marks the grading assignment as graded, all in one transaction. This is the ONLY path "
+        "that transitions an application to `graded` - the generic admin status endpoint "
+        "explicitly refuses to set it directly. The application must currently be "
+        "`grading_assigned` - once graded, resubmitting is rejected (409) so a stray retry can't "
+        "silently overwrite a score after the workflow has already moved past grading; an admin "
+        "must re-open grading (re-run grading-assignment) before a correction can be submitted."
+    ),
+    responses={
+        401: {"model": schemas.ErrorResponse, "description": "Missing/invalid/expired access token"},
+        403: {
+            "model": schemas.ErrorResponse,
+            "description": "Not a teacher account, or this application isn't assigned to you",
+        },
+        404: {"model": schemas.ErrorResponse, "description": "No application with that id"},
+        409: {"model": schemas.ErrorResponse, "description": "Application is not currently 'grading_assigned'"},
+        422: {"model": schemas.ValidationErrorResponse, "description": "Malformed request body"},
+    },
+)
+def submit_admission_grading_result(
+    application_id: str,
+    payload: schemas.GradingResultIn,
+    principal: dict = Depends(oauth2.require_user_type("teacher")),
+    db: Session = Depends(get_db),
+):
+    assignment = (
+        db.query(models.ApplicationGradingAssignment)
+        .filter(models.ApplicationGradingAssignment.application_id == application_id)
+        .first()
+    )
+    if not assignment or assignment.teacher_id != principal["id"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error_code": "NOT_ASSIGNED",
+                "message": "This application is not assigned to you for grading",
+            },
+        )
+
+    application = db.query(models.Application).filter(models.Application.id == application_id).first()
+    if not application:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_code": "APPLICATION_NOT_FOUND", "message": f"No application with id '{application_id}'"},
+        )
+    if application.status != "grading_assigned":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error_code": "APPLICATION_NOT_READY",
+                "message": f"Application must be 'grading_assigned' to submit a grading result "
+                f"(currently '{application.status}')",
+            },
+        )
+
+    result_id = f"aexr_{application_id}"
+    result_row = db.query(models.ApplicationExamResult).filter(models.ApplicationExamResult.id == result_id).first()
+    if result_row:
+        result_row.marks = payload.marks
+        result_row.total = payload.total
+        result_row.remarks = payload.remarks
+        result_row.graded_by = principal["id"]
+    else:
+        result_row = models.ApplicationExamResult(
+            id=result_id,
+            application_id=application_id,
+            marks=payload.marks,
+            total=payload.total,
+            remarks=payload.remarks,
+            graded_by=principal["id"],
+        )
+        db.add(result_row)
+
+    application.entrance_score = payload.marks
+    application.status = "graded"
+    assignment.status = "graded"
+    db.commit()
+
+    exam_schedule = (
+        db.query(models.ApplicationExamSchedule)
+        .filter(models.ApplicationExamSchedule.application_id == application_id)
+        .first()
+    )
+    return schemas.ApplicationGradingOut(
+        application_id=application_id,
+        roll_number=exam_schedule.roll_number if exam_schedule else "",
+        applying_class=application.applying_class,
+        exam_date=exam_schedule.exam_date if exam_schedule else None,
+        status=assignment.status,
+        marks=result_row.marks,
+        total=result_row.total,
+    )

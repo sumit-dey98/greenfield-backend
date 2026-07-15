@@ -206,6 +206,157 @@ class PasswordResetRequest(Base):
     created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class AdmissionCycle(Base):
+    """A single admissions intake period (e.g. "2026-27 Intake"). Exactly one row should have
+    is_active=True at a time (enforced in application code in admin_admissions.py, not a DB
+    constraint - see AdmissionCycleUpdate handling)."""
+
+    __tablename__ = "admission_cycles"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    academic_year: Mapped[Optional[str]] = mapped_column(String)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    seats_available: Mapped[Optional[int]] = mapped_column(Integer)
+    results_published: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Application(Base):
+    """A single admissions application. No password/login - access to status is via
+    reference_number + matching contact_email/contact_phone (see admissions_public.py)."""
+
+    __tablename__ = "applications"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    reference_number: Mapped[str] = mapped_column(String, unique=True, nullable=False, index=True)
+    cycle_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("admission_cycles.id"), index=True)
+    student_name: Mapped[str] = mapped_column(String, nullable=False)
+    photo_url: Mapped[Optional[str]] = mapped_column(String)  # Cloudinary secure_url, required at apply time
+    dob: Mapped[Optional[date]] = mapped_column(Date)
+    gender: Mapped[Optional[str]] = mapped_column(String)
+    applying_class: Mapped[Optional[str]] = mapped_column(String)
+    blood_group: Mapped[Optional[str]] = mapped_column(String)
+    previous_school: Mapped[Optional[str]] = mapped_column(String)
+    contact_method: Mapped[str] = mapped_column(String, nullable=False)  # "email" | "phone"
+    contact_email: Mapped[Optional[str]] = mapped_column(String, index=True)
+    contact_phone: Mapped[Optional[str]] = mapped_column(String, index=True)
+    guardian_name: Mapped[Optional[str]] = mapped_column(String)
+    guardian_relationship: Mapped[Optional[str]] = mapped_column(String)
+    guardian_phone: Mapped[Optional[str]] = mapped_column(String)
+    guardian_email: Mapped[Optional[str]] = mapped_column(String)
+    guardian_occupation: Mapped[Optional[str]] = mapped_column(String)
+    address: Mapped[Optional[str]] = mapped_column(Text)
+    medical_conditions: Mapped[Optional[str]] = mapped_column(Text)
+    extracurricular: Mapped[Optional[str]] = mapped_column(Text)
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String, nullable=False, default="submitted", index=True)
+    entrance_score: Mapped[Optional[int]] = mapped_column(Integer)
+    interview_outcome: Mapped[Optional[str]] = mapped_column(String)
+    interview_notes: Mapped[Optional[str]] = mapped_column(Text)
+    decision_notes: Mapped[Optional[str]] = mapped_column(Text)
+    submitted_ip: Mapped[Optional[str]] = mapped_column(String)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ApplicationDocument(Base):
+    __tablename__ = "application_documents"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    application_id: Mapped[str] = mapped_column(
+        String, ForeignKey("applications.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    url: Mapped[str] = mapped_column(String, nullable=False)
+    public_id: Mapped[Optional[str]] = mapped_column(String)
+    file_name: Mapped[Optional[str]] = mapped_column(String)
+    mime_type: Mapped[Optional[str]] = mapped_column(String)
+    size_bytes: Mapped[Optional[int]] = mapped_column(Integer)
+    doc_type: Mapped[Optional[str]] = mapped_column(String)
+    uploaded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ApplicationExamSchedule(Base):
+    __tablename__ = "application_exam_schedules"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    application_id: Mapped[str] = mapped_column(
+        String, ForeignKey("applications.id", ondelete="CASCADE"), unique=True, index=True, nullable=False
+    )
+    exam_date: Mapped[Optional[date]] = mapped_column(Date)
+    exam_time: Mapped[Optional[str]] = mapped_column(String)
+    venue: Mapped[Optional[str]] = mapped_column(String)
+    # Generated at schedule time (utils.generate_roll_number) - deliberately NOT derived from
+    # reference_number or any PII, since this is the identifier exposed to the blind grading flow.
+    roll_number: Mapped[str] = mapped_column(String, unique=True, index=True, nullable=False)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ApplicationGradingAssignment(Base):
+    """One teacher assigned to grade one applicant's entrance exam paper. Unique per
+    application - no multi-grader. Grading is blind: see schemas.ApplicationGradingOut."""
+
+    __tablename__ = "application_grading_assignments"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    application_id: Mapped[str] = mapped_column(
+        String, ForeignKey("applications.id", ondelete="CASCADE"), unique=True, index=True, nullable=False
+    )
+    teacher_id: Mapped[str] = mapped_column(String, ForeignKey("teachers.id"), index=True, nullable=False)
+    assigned_by: Mapped[Optional[str]] = mapped_column(String)  # admin user id
+    assigned_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    status: Mapped[str] = mapped_column(String, nullable=False, default="assigned")  # assigned | graded
+
+
+class ApplicationExamResult(Base):
+    """Deterministic id (f"aexr_{application_id}") supports upsert-by-natural-key, same pattern
+    as models.Result."""
+
+    __tablename__ = "application_exam_results"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    application_id: Mapped[str] = mapped_column(
+        String, ForeignKey("applications.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    marks: Mapped[Optional[int]] = mapped_column(Integer)
+    total: Mapped[Optional[int]] = mapped_column(Integer, default=100)
+    remarks: Mapped[Optional[str]] = mapped_column(String)
+    graded_by: Mapped[Optional[str]] = mapped_column(String)  # teacher id
+    graded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ApplicationInterview(Base):
+    __tablename__ = "application_interviews"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    application_id: Mapped[str] = mapped_column(
+        String, ForeignKey("applications.id", ondelete="CASCADE"), unique=True, index=True, nullable=False
+    )
+    interview_date: Mapped[Optional[date]] = mapped_column(Date)
+    interview_time: Mapped[Optional[str]] = mapped_column(String)
+    mode: Mapped[Optional[str]] = mapped_column(String)  # in_person | phone | video
+    interviewer_name: Mapped[Optional[str]] = mapped_column(String)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class SubmissionAttempt(Base):
+    """One row per POST /admissions/apply attempt (success or rejected), inserted before the
+    rest of the apply logic runs - Postgres-backed sliding-window rate limit, survives restarts
+    and multi-worker deployments (unlike an in-memory limiter)."""
+
+    __tablename__ = "submission_attempts"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ip_address: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+class VerifyAttempt(Base):
+    """One row per POST /admissions/{ref}/verify call (success or failure) - backs the
+    per-reference-number lockout."""
+
+    __tablename__ = "verify_attempts"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    reference_number: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    success: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    ip_address: Mapped[Optional[str]] = mapped_column(String)
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
 class Count(Base):
     """A single pre-aggregated number, kept in sync with its source rows on every write
     (see utils.bump_count). One row per (scope, metric, period[, subject]) - e.g. how many

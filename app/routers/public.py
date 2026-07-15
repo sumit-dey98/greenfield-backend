@@ -167,10 +167,18 @@ def list_public_faculty(db: Session = Depends(get_db)):
     "/admission-status",
     response_model=schemas.AdmissionStatusOut,
     summary="Check whether admissions are currently open",
-    description="Public, no auth required.",
+    description="Public, no auth required. Includes the active admission cycle's name/year "
+    "(if one exists) so the applicant-facing page can display it instead of a hardcoded year.",
 )
 def get_public_admission_status(db: Session = Depends(get_db)):
     row = db.query(models.AdmissionOpen).filter(models.AdmissionOpen.id == "admission_status").first()
+    cycle = db.query(models.AdmissionCycle).filter(models.AdmissionCycle.is_active == True).first()  # noqa: E712
+    cycle_name = cycle.name if cycle else None
+    academic_year = cycle.academic_year if cycle else None
     if not row:
-        return schemas.AdmissionStatusOut(id="admission_status", value=False)
-    return row
+        return schemas.AdmissionStatusOut(
+            id="admission_status", value=False, cycle_name=cycle_name, academic_year=academic_year,
+        )
+    return schemas.AdmissionStatusOut(
+        id=row.id, value=row.value, cycle_name=cycle_name, academic_year=academic_year,
+    )
