@@ -94,6 +94,7 @@ class Event(Base):
     author_id: Mapped[Optional[str]] = mapped_column(String)
     author_name: Mapped[Optional[str]] = mapped_column(String)
     published: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
+    featured: Mapped[Optional[bool]] = mapped_column(Boolean, default=False)
     created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -221,6 +222,21 @@ class AdmissionCycle(Base):
     created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class AdmissionCycleClass(Base):
+    """Which classes a given admission cycle accepts applications for. Plain many-to-many
+    join, no uniqueness constraint - a class may appear in more than one cycle (e.g.
+    overlapping intake periods), and this table doesn't try to prevent that."""
+
+    __tablename__ = "admission_cycle_classes"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    cycle_id: Mapped[str] = mapped_column(
+        String, ForeignKey("admission_cycles.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    class_id: Mapped[str] = mapped_column(
+        String, ForeignKey("classes.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+
+
 class Application(Base):
     """A single admissions application. No password/login - access to status is via
     reference_number + matching contact_email/contact_phone (see admissions_public.py)."""
@@ -284,6 +300,7 @@ class ApplicationExamSchedule(Base):
     exam_date: Mapped[Optional[date]] = mapped_column(Date)
     exam_time: Mapped[Optional[str]] = mapped_column(String)
     venue: Mapped[Optional[str]] = mapped_column(String)
+    room: Mapped[Optional[str]] = mapped_column(String)  # e.g. "Room 204" - within the venue
     # Generated at schedule time (utils.generate_roll_number) - deliberately NOT derived from
     # reference_number or any PII, since this is the identifier exposed to the blind grading flow.
     roll_number: Mapped[str] = mapped_column(String, unique=True, index=True, nullable=False)
@@ -331,6 +348,11 @@ class ApplicationInterview(Base):
     interview_time: Mapped[Optional[str]] = mapped_column(String)
     mode: Mapped[Optional[str]] = mapped_column(String)  # in_person | phone | video
     interviewer_name: Mapped[Optional[str]] = mapped_column(String)
+    # Mode-specific location detail - only the one matching `mode` is expected to be set, but
+    # nothing enforces that at the DB level (mirrors the codebase's light-touch invariant style).
+    room: Mapped[Optional[str]] = mapped_column(String)  # in_person
+    meeting_link: Mapped[Optional[str]] = mapped_column(String)  # video
+    phone_number: Mapped[Optional[str]] = mapped_column(String)  # phone
     created_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

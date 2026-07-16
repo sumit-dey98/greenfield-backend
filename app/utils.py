@@ -298,12 +298,14 @@ def generate_admit_card_pdf(*, student_name: str, reference_number: str, roll_nu
         c.setFont("Helvetica", 6)
         c.drawCentredString(photo_box_x + photo_size / 2, photo_box_y + photo_size / 2, "Photo")
 
-    # Detail rows (left column, alongside the photo)
+    # Detail rows (left column, alongside the photo). Reference number is deliberately NOT
+    # listed here - it's placed as small unlabeled text in the footer corner instead (see
+    # below), since it's an internal lookup key, not a detail the applicant needs to read
+    # off this card at the exam venue.
     rows = [
         ("Student Name", student_name or "-"),
         ("Applying For", applying_class or "-"),
         ("Roll Number", roll_number or "-"),
-        ("Reference No.", reference_number or "-"),
         ("Exam Date", str(exam_date) if exam_date else "TBA"),
         ("Exam Time", exam_time or "TBA"),
         ("Venue", venue or "TBA"),
@@ -331,9 +333,152 @@ def generate_admit_card_pdf(*, student_name: str, reference_number: str, roll_nu
     c.setFillColorRGB(0.5, 0.5, 0.5)
     c.drawCentredString(width / 2, 6 * mm, "Bring this admit card and a valid photo ID to the exam venue.")
 
+    # Reference number, unlabeled, small, bottom-right corner - an internal lookup key rather
+    # than exam-day information, so it doesn't belong in the main detail list.
+    c.setFont("Helvetica", 6)
+    c.setFillColorRGB(0.6, 0.6, 0.6)
+    c.drawRightString(width - 6 * mm, 3 * mm, reference_number or "")
+
     c.showPage()
     c.save()
     return buf.getvalue()
+
+
+_LUGRASIMO_PATH = "app/assets/fonts/Lugrasimo-Regular.ttf"
+_lugrasimo_registered = False
+
+
+def _ensure_lugrasimo_registered():
+    """Registers the vendored Lugrasimo TTF with reportlab on first use. Downloaded once from
+    Google Fonts' official OFL-licensed repo (google/fonts) into app/assets/fonts/ - there's
+    no next/font equivalent on the backend, since this is a separate Python process rendering
+    PDFs, not a browser."""
+    global _lugrasimo_registered
+    if _lugrasimo_registered:
+        return
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    pdfmetrics.registerFont(TTFont("Lugrasimo", _LUGRASIMO_PATH))
+    _lugrasimo_registered = True
+
+
+def generate_acceptance_letter_pdf(*, student_name: str, applying_class: str | None,
+                                    cycle_name: str | None, reference_number: str,
+                                    signatory_name: str | None, signatory_role: str | None) -> bytes:
+    """Renders a one-page formal acceptance letter PDF in memory and returns the raw bytes.
+    Only meaningful for status == 'accepted' - callers are responsible for that gate, this
+    function just renders whatever it's given."""
+    import io
+    from datetime import date as date_cls
+
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib.colors import HexColor, white
+    from reportlab.pdfgen import canvas
+
+    _ensure_lugrasimo_registered()
+
+    buf = io.BytesIO()
+    width, height = A4
+    c = canvas.Canvas(buf, pagesize=A4)
+
+    primary = HexColor("#059669")  # matches --color-primary in app/globals.css
+
+    # Header band
+    band_height = 32 * mm
+    c.setFillColor(primary)
+    c.rect(0, height - band_height, width, band_height, stroke=0, fill=1)
+    c.setFillColor(white)
+    c.setFont("Lugrasimo", 24)
+    c.drawCentredString(width / 2, height - 16 * mm, "Greenfield Academy")
+    c.setFont("Lugrasimo", 11)
+    c.drawCentredString(width / 2, height - 25 * mm, "info@greenfieldacademy.edu.bd | +880-2-9876543")
+
+    # Body - Lugrasimo throughout for a handwritten-letter feel. Script fonts read smaller and
+    # need more line-height than a sans-serif at the same point size, so sizes/spacing here run
+    # larger than the admit card's Helvetica-based layout.
+    y = height - band_height - 20 * mm
+    c.setFillColor(HexColor("#000000"))
+    c.setFont("Lugrasimo", 20)
+    c.drawCentredString(width / 2, y, "Admission Acceptance Letter")
+    y -= 16 * mm
+
+    c.setFont("Lugrasimo", 13)
+    c.drawString(25 * mm, y, date_cls.today().strftime("%B %d, %Y"))
+    y -= 12 * mm
+
+    c.setFont("Lugrasimo", 15)
+    c.drawString(25 * mm, y, student_name or "-")
+    y -= 7 * mm
+    if applying_class:
+        c.setFont("Lugrasimo", 13)
+        c.drawString(25 * mm, y, f"Admitted to: {applying_class}")
+        y -= 7 * mm
+    y -= 6 * mm
+
+    c.setFont("Lugrasimo", 14)
+    c.drawString(25 * mm, y, f"Dear {student_name or 'Applicant'},")
+    y -= 12 * mm
+
+    body_paragraphs = [
+        f"We are pleased to inform you that your application to Greenfield Academy"
+        f"{f' for {cycle_name}' if cycle_name else ''} has been accepted. Welcome to our school "
+        f"community!",
+        "Your dedication throughout the admissions process, from the entrance examination to "
+        "the interview, truly stood out, and we are confident you will thrive as part of "
+        "Greenfield Academy.",
+        "Please be aware that your admission is contingent upon completing the enrollment "
+        "formalities communicated by our Admissions Office. Should you have any questions or "
+        "need further assistance, please do not hesitate to reach out.",
+    ]
+    text_width = width - 50 * mm
+    body_font_size = 13
+    c.setFont("Lugrasimo", body_font_size)
+    for para in body_paragraphs:
+        wrapped = _wrap_text(c, para, "Lugrasimo", body_font_size, text_width)
+        for line in wrapped:
+            c.drawString(25 * mm, y, line)
+            y -= 7 * mm
+        y -= 5 * mm
+
+    y -= 6 * mm
+    c.setFont("Lugrasimo", 13)
+    c.drawString(25 * mm, y, "Sincerely,")
+    y -= 16 * mm
+    c.setFont("Lugrasimo", 20)
+    c.setFillColor(primary)
+    c.drawString(25 * mm, y, signatory_name or "The Admissions Office")
+    y -= 8 * mm
+    c.setFillColor(HexColor("#000000"))
+    c.setFont("Lugrasimo", 11)
+    c.drawString(25 * mm, y, signatory_role or "Greenfield Academy")
+
+    c.setFont("Helvetica", 6.5)
+    c.setFillColor(HexColor("#999999"))
+    c.drawRightString(width - 10 * mm, 8 * mm, reference_number or "")
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def _wrap_text(c, text: str, font: str, size: int, max_width: float) -> list[str]:
+    """Greedy word-wrap for reportlab canvas text (no built-in paragraph flow used here since
+    the letter's layout is otherwise manually positioned, not a Platypus flowable)."""
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if c.stringWidth(candidate, font, size) <= max_width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
 
 
 _TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"

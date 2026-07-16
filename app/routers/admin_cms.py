@@ -27,6 +27,20 @@ def _apply_updates(row, payload, exclude_unset_fields: set):
         setattr(row, field, getattr(payload, field))
 
 
+MAX_FEATURED_EVENTS = 6
+
+
+def _enforce_featured_cap(db: Session, exclude_id: Optional[str] = None):
+    """Keeps at most MAX_FEATURED_EVENTS featured - 1 events featured. Called right before
+    featuring one more, so the oldest (by `date`) among the rest gets bumped to make room."""
+    query = db.query(models.Event).filter(models.Event.featured.is_(True))
+    if exclude_id:
+        query = query.filter(models.Event.id != exclude_id)
+    featured = query.order_by(models.Event.date.desc(), models.Event.created_at.desc()).all()
+    for stale in featured[MAX_FEATURED_EVENTS - 1:]:
+        stale.featured = False
+
+
 def _unique_slug(db: Session, base_slug: str, exclude_id: Optional[str] = None) -> str:
     """Appends -2, -3, ... until the slug is free. events.slug has a DB unique constraint,
     so this avoids a raw IntegrityError 500 on the obvious case (two events, same title)."""
@@ -208,13 +222,14 @@ def delete_notice(notice_id: str, db: Session = Depends(get_db), _principal: dic
     response_model=schemas.Page[schemas.EventOut],
     tags=["admin-events"],
     summary="List all events",
-    description="Admin view - includes unpublished drafts. Filter by `published`, `category`, "
-    "`author_id`, `title` (partial/case-insensitive search), and/or date range via `date_from`/`date_to`. "
-    "Paginated via `limit`/`offset`.",
+    description="Admin view - includes unpublished drafts. Filter by `published`, `featured`, "
+    "`category`, `author_id`, `title` (partial/case-insensitive search), and/or date range via "
+    "`date_from`/`date_to`. Paginated via `limit`/`offset`.",
     responses={403: {"model": schemas.ErrorResponse, "description": "Role lacks 'cms' permission"}},
 )
 def list_events(
     published: Optional[bool] = Query(None),
+    featured: Optional[bool] = Query(None),
     category: Optional[schemas.EventCategory] = Query(None),
     author_id: Optional[str] = Query(None),
     title: Optional[str] = Query(None, description="Partial, case-insensitive match on title"),
@@ -228,6 +243,8 @@ def list_events(
     query = db.query(models.Event)
     if published is not None:
         query = query.filter(models.Event.published == published)
+    if featured is not None:
+        query = query.filter(models.Event.featured == featured)
     if category:
         query = query.filter(models.Event.category == category)
     if author_id:
@@ -288,6 +305,8 @@ def create_event(payload: schemas.EventIn, db: Session = Depends(get_db), princi
             detail={"error_code": "ID_ALREADY_EXISTS", "message": f"Event '{row_id}' already exists"},
         )
     slug = _unique_slug(db, payload.slug or utils.slugify(payload.title))
+    if payload.featured:
+        _enforce_featured_cap(db)
 
     row = models.Event(
         id=row_id,
@@ -301,6 +320,7 @@ def create_event(payload: schemas.EventIn, db: Session = Depends(get_db), princi
         author_id=principal["id"],
         author_name=payload.author_name,
         published=payload.published,
+        featured=payload.featured,
     )
     db.add(row)
     db.commit()
@@ -328,6 +348,8 @@ def update_event(
     fields = payload.model_dump(exclude_unset=True)
     if "slug" in fields:
         fields["slug"] = _unique_slug(db, fields["slug"], exclude_id=event_id)
+    if fields.get("featured") and not row.featured:
+        _enforce_featured_cap(db, exclude_id=event_id)
     for field, value in fields.items():
         setattr(row, field, value)
     db.commit()

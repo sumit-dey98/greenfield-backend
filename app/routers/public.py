@@ -9,6 +9,8 @@ from ..database import get_db
 
 router = APIRouter(tags=["public"])
 
+MAX_FEATURED_EVENTS = 6
+
 # No oauth2 import, no Depends(require_*) anywhere in this file - these routes are
 # intentionally public. Each query is unconditionally filtered to the "live" subset (no
 # drafts, no expired notices, no inactive testimonials) - there's no auth-conditional branch
@@ -19,7 +21,7 @@ router = APIRouter(tags=["public"])
     "/notices",
     response_model=schemas.Page[schemas.NoticeOut],
     summary="List notices",
-    description="Public, no auth required. Returns all notices, including expired ones - "
+    description=" Returns all notices, including expired ones - "
     "filter by `category`, `title` (partial/case-insensitive search), and/or date range on "
     "`date` or `expires` if you only want current/relevant ones. Paginated via `limit`/`offset`.",
 )
@@ -56,7 +58,7 @@ def list_public_notices(
     "/events",
     response_model=schemas.Page[schemas.EventOut],
     summary="List published events",
-    description="Public, no auth required. Only returns events with `published: true`. "
+    description=" Only returns events with `published: true`. "
     "Filter by `category`, `author_id`, `title` (partial/case-insensitive search), and/or "
     "date range via `date_from`/`date_to`. Paginated via `limit`/`offset`.",
 )
@@ -87,10 +89,28 @@ def list_public_events(
 
 
 @router.get(
+    "/events/featured",
+    response_model=List[schemas.EventOut],
+    summary="List featured published events",
+    description=" Only returns events with `published: true` and "
+    f"`featured: true`, capped at {MAX_FEATURED_EVENTS}."
+    " Not paginated. Ordered by `date` descending.",
+)
+def list_featured_events(db: Session = Depends(get_db)):
+    return (
+        db.query(models.Event)
+        .filter(models.Event.published.is_(True), models.Event.featured.is_(True))
+        .order_by(models.Event.date.desc())
+        .limit(MAX_FEATURED_EVENTS)
+        .all()
+    )
+
+
+@router.get(
     "/events/{slug}",
     response_model=schemas.EventWithImagesOut,
     summary="Get one published event by slug, with its images",
-    description="Public, no auth required. Looks up by `slug`, not `id` - matches how a blog "
+    description=" Looks up by `slug`, not `id` - matches how a blog "
     "post URL normally works. An unpublished event's slug returns 404, same as a nonexistent one "
     "- doesn't reveal that a draft exists at that slug.",
     responses={404: {"model": schemas.ErrorResponse, "description": "No published event with that slug"}},
@@ -119,7 +139,7 @@ def get_public_event(slug: str, db: Session = Depends(get_db)):
     "/testimonials",
     response_model=List[schemas.TestimonialOut],
     summary="List active testimonials",
-    description="Public, no auth required. Only returns testimonials with `active: true`. "
+    description=" Only returns testimonials with `active: true`. "
     "Filter by `class_id` and/or `name` (partial, case-insensitive search).",
 )
 def list_public_testimonials(
@@ -155,19 +175,57 @@ def list_public_testimonials(
     "/faculty",
     response_model=List[schemas.FacultyOut],
     summary="List faculty/staff for the public site",
-    description="Public, no auth required. Returns the school's teaching and leadership staff "
+    description=" Returns the school's teaching and leadership staff "
     "for the public faculty page, ordered by join date. Exposes only public-facing fields "
-    "(name, role, subject, avatar, contact, bio/message) — never passwords or internal data.",
+    "(name, role, subject, avatar, contact, bio/message) — never passwords or internal data. "
+    "Optional `role` (exact match, e.g. \"Principal\") and `subject` (partial, case-insensitive) "
+    "filters - used e.g. by the admission acceptance letter to look up a specific signatory "
+    "without guessing at a name.",
 )
-def list_public_faculty(db: Session = Depends(get_db)):
-    return db.query(models.Teacher).order_by(models.Teacher.join_date).all()
+def list_public_faculty(
+    role: Optional[str] = Query(None, description="Exact match on Teacher.role, e.g. \"Principal\""),
+    subject: Optional[str] = Query(None, description="Partial, case-insensitive match on Teacher.subject"),
+    db: Session = Depends(get_db),
+):
+    query = db.query(models.Teacher)
+    if role:
+        query = query.filter(models.Teacher.role == role)
+    if subject:
+        query = query.filter(models.Teacher.subject.ilike(f"%{subject}%"))
+    return query.order_by(models.Teacher.join_date).all()
+
+
+@router.get(
+    "/classes",
+    response_model=List[schemas.ClassPublicOut],
+    summary="List classes accepted by the active admission cycle (public, minimal fields)",
+    description="Public, no auth required. Used by the admission form's \"Applying for "
+    "Class\" dropdown. Scoped to whichever classes are attached to the currently active "
+    "AdmissionCycle - if the active cycle has no classes attached (or no cycle is active), "
+    "returns ALL classes as a fallback so the form isn't left with an empty dropdown before "
+    "an admin has configured cycle scoping. Excludes room/teacher_id (internal scheduling "
+    "detail) - see GET /admin/classes for the full admin view.",
+)
+def list_public_classes(db: Session = Depends(get_db)):
+    active_cycle = db.query(models.AdmissionCycle).filter(models.AdmissionCycle.is_active.is_(True)).first()
+    if active_cycle:
+        scoped = (
+            db.query(models.Class)
+            .join(models.AdmissionCycleClass, models.AdmissionCycleClass.class_id == models.Class.id)
+            .filter(models.AdmissionCycleClass.cycle_id == active_cycle.id)
+            .order_by(models.Class.grade, models.Class.section)
+            .all()
+        )
+        if scoped:
+            return scoped
+    return db.query(models.Class).order_by(models.Class.grade, models.Class.section).all()
 
 
 @router.get(
     "/admission-status",
     response_model=schemas.AdmissionStatusOut,
     summary="Check whether admissions are currently open",
-    description="Public, no auth required. Includes the active admission cycle's name/year "
+    description=" Includes the active admission cycle's name/year "
     "(if one exists) so the applicant-facing page can display it instead of a hardcoded year.",
 )
 def get_public_admission_status(db: Session = Depends(get_db)):

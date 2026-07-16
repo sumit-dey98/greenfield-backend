@@ -498,6 +498,19 @@ class ClassOut(BaseModel):
         from_attributes = True
 
 
+class ClassPublicOut(BaseModel):
+    """Minimal public-facing class listing (e.g. for the admission form's "Applying for
+    Class" dropdown) - no room/teacher_id, which are internal scheduling/staffing detail."""
+
+    id: str
+    name: Optional[str] = None
+    grade: Optional[int] = None
+    section: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
 class ClassRosterOut(BaseModel):
     class_info: ClassOut
     students: List[StudentOut]
@@ -872,6 +885,7 @@ class EventOut(BaseModel):
     author_id: Optional[str] = None
     author_name: Optional[str] = None
     published: Optional[bool] = False
+    featured: Optional[bool] = False
     created_at: Optional[datetime] = None
 
     class Config:
@@ -893,6 +907,7 @@ class EventIn(BaseModel):
     cover_image: Optional[str] = None
     author_name: Optional[str] = None
     published: bool = False
+    featured: bool = False
 
 
 class EventUpdate(BaseModel):
@@ -905,6 +920,7 @@ class EventUpdate(BaseModel):
     cover_image: Optional[str] = None
     author_name: Optional[str] = None
     published: Optional[bool] = None
+    featured: Optional[bool] = None
 
 
 class TestimonialOut(BaseModel):
@@ -994,6 +1010,16 @@ class InterviewMode(str, Enum):
     video = "video"
 
 
+class CycleClassOut(BaseModel):
+    """Minimal (id, name) view of a class attached to an admission cycle."""
+
+    id: str
+    name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
 class AdmissionCycleOut(BaseModel):
     id: str
     name: str
@@ -1002,6 +1028,7 @@ class AdmissionCycleOut(BaseModel):
     seats_available: Optional[int] = None
     results_published: bool
     created_at: Optional[datetime] = None
+    classes: List[CycleClassOut] = []
 
     class Config:
         from_attributes = True
@@ -1014,6 +1041,7 @@ class AdmissionCycleIn(BaseModel):
     is_active: bool = True
     seats_available: Optional[int] = None
     results_published: bool = False
+    class_ids: List[str] = []  # which classes this cycle accepts applications for
 
 
 class AdmissionCycleUpdate(BaseModel):
@@ -1022,6 +1050,7 @@ class AdmissionCycleUpdate(BaseModel):
     is_active: Optional[bool] = None
     seats_available: Optional[int] = None
     results_published: Optional[bool] = None
+    class_ids: Optional[List[str]] = None  # if provided, replaces the cycle's class list entirely
 
 
 class ApplicationIn(BaseModel):
@@ -1108,6 +1137,7 @@ class ApplicationTrackExamScheduleOut(BaseModel):
     exam_date: Optional[date_type] = None
     exam_time: Optional[str] = None
     venue: Optional[str] = None
+    room: Optional[str] = None
     roll_number: str
 
     class Config:
@@ -1118,6 +1148,9 @@ class ApplicationTrackInterviewOut(BaseModel):
     interview_date: Optional[date_type] = None
     interview_time: Optional[str] = None
     mode: Optional[str] = None
+    room: Optional[str] = None
+    meeting_link: Optional[str] = None
+    phone_number: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -1144,6 +1177,10 @@ class ApplicationTrackOut(BaseModel):
     address: Optional[str] = None
     visible_status: str
     cycle_name: Optional[str] = None
+    # Own entrance-exam score once graded - safe to show back to the applicant. Deliberately
+    # NOT their rank/merit-list position, which reveals competitive standing before a final
+    # decision and is kept admin-only (see MeritListEntryOut).
+    entrance_score: Optional[int] = None
     documents: List[ApplicationDocumentPublicOut] = []
     exam_schedule: Optional[ApplicationTrackExamScheduleOut] = None
     interview: Optional[ApplicationTrackInterviewOut] = None
@@ -1173,6 +1210,7 @@ class ExamScheduleOut(BaseModel):
     exam_date: Optional[date_type] = None
     exam_time: Optional[str] = None
     venue: Optional[str] = None
+    room: Optional[str] = None
     roll_number: str
 
     class Config:
@@ -1205,6 +1243,9 @@ class InterviewOut(BaseModel):
     interview_time: Optional[str] = None
     mode: Optional[str] = None
     interviewer_name: Optional[str] = None
+    room: Optional[str] = None
+    meeting_link: Optional[str] = None
+    phone_number: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -1259,6 +1300,7 @@ class ExamScheduleIn(BaseModel):
     exam_date: Optional[date_type] = None
     exam_time: Optional[str] = None
     venue: Optional[str] = None
+    room: Optional[str] = None
 
 
 class BulkExamScheduleIn(BaseModel):
@@ -1266,6 +1308,7 @@ class BulkExamScheduleIn(BaseModel):
     exam_date: Optional[date_type] = None
     exam_time: Optional[str] = None
     venue: Optional[str] = None
+    room: Optional[str] = None
 
 
 class GradingAssignmentIn(BaseModel):
@@ -1301,6 +1344,9 @@ class InterviewScheduleIn(BaseModel):
     interview_time: Optional[str] = None
     mode: InterviewMode
     interviewer_name: Optional[str] = None
+    room: Optional[str] = None  # in_person
+    meeting_link: Optional[str] = None  # video
+    phone_number: Optional[str] = None  # phone
 
 
 class InterviewOutcomeIn(BaseModel):

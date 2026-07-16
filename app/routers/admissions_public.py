@@ -167,6 +167,26 @@ def apply(
     # 2. Active cycle.
     cycle = _get_active_cycle(db)
 
+    # 2a. If the active cycle has classes attached, applying_class must be one of them - mirrors
+    # the fallback behavior of GET /classes (an unconfigured cycle with no classes attached
+    # doesn't restrict anything, so applicants aren't locked out before an admin sets this up).
+    cycle_class_names = {
+        name
+        for (name,) in db.query(models.Class.name)
+        .join(models.AdmissionCycleClass, models.AdmissionCycleClass.class_id == models.Class.id)
+        .filter(models.AdmissionCycleClass.cycle_id == cycle.id)
+        .all()
+    }
+    if cycle_class_names and payload.applying_class not in cycle_class_names:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error_code": "INVALID_APPLYING_CLASS",
+                "message": f"'{payload.applying_class}' is not one of the classes accepted by the "
+                "current admission cycle.",
+            },
+        )
+
     # 3. IP rate limit - note request.client.host has no reverse-proxy header handling yet
     # (no X-Forwarded-For support); fine behind a single-hop deployment, revisit if a proxy
     # is added in front of this API.
@@ -485,6 +505,7 @@ def get_status(
         address=application.address,
         visible_status=visible_status,
         cycle_name=cycle.name if cycle else None,
+        entrance_score=application.entrance_score,
         documents=documents,
         exam_schedule=exam_schedule_row,
         interview=interview_row,
@@ -566,4 +587,63 @@ def get_admit_card(
         content=pdf_bytes,
         media_type="application/pdf",
         headers={"Content-Disposition": f'inline; filename="admit-card-{application.reference_number}.pdf"'},
+    )
+
+
+@router.get(
+    "/{reference_number}/acceptance-letter",
+    summary="Download the formal acceptance letter as a PDF",
+    description=(
+        "Requires the same admission-access token as GET /status. Only available once the "
+        "application is `accepted` AND the cycle's results have been published (the same gate "
+        "that unmasks `visible_status` on GET /status) - 409 otherwise. Signed by the school's "
+        "Principal (looked up via GET /faculty?role=Principal at render time; falls back to a "
+        "generic \"The Admissions Office\" signature if no Principal record exists). Returns "
+        "`application/pdf` bytes, not JSON."
+    ),
+    responses={
+        401: {"model": schemas.ErrorResponse, "description": "Missing/invalid/expired admission access token"},
+        403: {"model": schemas.ErrorResponse, "description": "Token was not issued for this reference_number"},
+        404: {"model": schemas.ErrorResponse, "description": "No application with that reference number"},
+        409: {"model": schemas.ErrorResponse, "description": "Not accepted, or results not yet published (LETTER_NOT_AVAILABLE)"},
+    },
+)
+def get_acceptance_letter(
+    reference_number: str = Depends(oauth2.require_admission_access),
+    db: Session = Depends(get_db),
+):
+    application = (
+        db.query(models.Application).filter(models.Application.reference_number == reference_number).first()
+    )
+    if not application:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error_code": "APPLICATION_NOT_FOUND", "message": f"No application with reference number '{reference_number}'"},
+        )
+    cycle = db.query(models.AdmissionCycle).filter(models.AdmissionCycle.id == application.cycle_id).first()
+    results_published = bool(cycle and cycle.results_published)
+    if application.status != "accepted" or not results_published:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error_code": "LETTER_NOT_AVAILABLE",
+                "message": "The acceptance letter is only available once your application has been "
+                "accepted and results have been published.",
+            },
+        )
+
+    principal = db.query(models.Teacher).filter(models.Teacher.role == "Principal").first()
+
+    pdf_bytes = utils.generate_acceptance_letter_pdf(
+        student_name=application.student_name,
+        applying_class=application.applying_class,
+        cycle_name=cycle.name if cycle else None,
+        reference_number=application.reference_number,
+        signatory_name=principal.name if principal else None,
+        signatory_role=f"{principal.role}, Greenfield Academy" if principal else None,
+    )
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="acceptance-letter-{application.reference_number}.pdf"'},
     )

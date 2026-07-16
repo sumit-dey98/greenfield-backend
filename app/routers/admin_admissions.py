@@ -202,7 +202,8 @@ def list_cycles(
 ):
     query = db.query(models.AdmissionCycle)
     total = query.count()
-    items = query.order_by(models.AdmissionCycle.created_at.desc()).offset(offset).limit(limit).all()
+    rows = query.order_by(models.AdmissionCycle.created_at.desc()).offset(offset).limit(limit).all()
+    items = [_build_cycle_out(db, row) for row in rows]
     return schemas.Page(items=items, total=total, limit=limit, offset=offset)
 
 
@@ -257,7 +258,7 @@ def update_status(
 # ---------------------------------------------------------------------------
 
 
-def _upsert_exam_schedule(db: Session, application: models.Application, exam_date, exam_time, venue) -> models.ApplicationExamSchedule:
+def _upsert_exam_schedule(db: Session, application: models.Application, exam_date, exam_time, venue, room=None) -> models.ApplicationExamSchedule:
     if application.status == "submitted":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -275,6 +276,7 @@ def _upsert_exam_schedule(db: Session, application: models.Application, exam_dat
         row.exam_date = exam_date
         row.exam_time = exam_time
         row.venue = venue
+        row.room = room
     else:
         row = models.ApplicationExamSchedule(
             id=utils.generate_id("aexm_"),
@@ -282,6 +284,7 @@ def _upsert_exam_schedule(db: Session, application: models.Application, exam_dat
             exam_date=exam_date,
             exam_time=exam_time,
             venue=venue,
+            room=room,
             roll_number=utils.generate_roll_number(),
         )
         db.add(row)
@@ -312,7 +315,7 @@ def bulk_schedule_exam(
 ):
     applications = [_get_application_or_404(db, aid) for aid in payload.application_ids]
     rows = [
-        _upsert_exam_schedule(db, app, payload.exam_date, payload.exam_time, payload.venue)
+        _upsert_exam_schedule(db, app, payload.exam_date, payload.exam_time, payload.venue, payload.room)
         for app in applications
     ]
     db.commit()
@@ -342,7 +345,7 @@ def schedule_exam(
     _principal: dict = ADMISSIONS,
 ):
     application = _get_application_or_404(db, application_id)
-    row = _upsert_exam_schedule(db, application, payload.exam_date, payload.exam_time, payload.venue)
+    row = _upsert_exam_schedule(db, application, payload.exam_date, payload.exam_time, payload.venue, payload.room)
     db.commit()
     db.refresh(row)
     return row
@@ -553,6 +556,9 @@ def schedule_interview(
         row.interview_time = payload.interview_time
         row.mode = payload.mode.value
         row.interviewer_name = payload.interviewer_name
+        row.room = payload.room
+        row.meeting_link = payload.meeting_link
+        row.phone_number = payload.phone_number
     else:
         row = models.ApplicationInterview(
             id=utils.generate_id("aint_"),
@@ -561,6 +567,9 @@ def schedule_interview(
             interview_time=payload.interview_time,
             mode=payload.mode.value,
             interviewer_name=payload.interviewer_name,
+            room=payload.room,
+            meeting_link=payload.meeting_link,
+            phone_number=payload.phone_number,
         )
         db.add(row)
     application.status = "interview_scheduled"
@@ -656,6 +665,34 @@ def bulk_update_status(
 # ---------------------------------------------------------------------------
 
 
+def _build_cycle_out(db: Session, cycle: models.AdmissionCycle) -> schemas.AdmissionCycleOut:
+    classes = (
+        db.query(models.Class)
+        .join(models.AdmissionCycleClass, models.AdmissionCycleClass.class_id == models.Class.id)
+        .filter(models.AdmissionCycleClass.cycle_id == cycle.id)
+        .order_by(models.Class.grade, models.Class.section)
+        .all()
+    )
+    return schemas.AdmissionCycleOut(
+        id=cycle.id,
+        name=cycle.name,
+        academic_year=cycle.academic_year,
+        is_active=cycle.is_active,
+        seats_available=cycle.seats_available,
+        results_published=cycle.results_published,
+        created_at=cycle.created_at,
+        classes=classes,
+    )
+
+
+def _set_cycle_classes(db: Session, cycle_id: str, class_ids: List[str]) -> None:
+    """Replaces the cycle's class list entirely with `class_ids` (delete-then-insert - the
+    join table has no other data on it, so there's nothing to preserve across the swap)."""
+    db.query(models.AdmissionCycleClass).filter(models.AdmissionCycleClass.cycle_id == cycle_id).delete()
+    for class_id in class_ids:
+        db.add(models.AdmissionCycleClass(id=utils.generate_id("acc_"), cycle_id=cycle_id, class_id=class_id))
+
+
 @router.post(
     "/cycles",
     response_model=schemas.AdmissionCycleOut,
@@ -663,7 +700,7 @@ def bulk_update_status(
     summary="Create an admission cycle",
     description="`id` is auto-generated (`cyc_xxxxxxxx`) if omitted. Does NOT automatically "
     "deactivate other cycles - set `is_active` explicitly / use PUT to enforce single-active-"
-    "cycle if needed.",
+    "cycle if needed. `class_ids` sets which classes this cycle accepts applications for.",
     responses={
         403: {"model": schemas.ErrorResponse, "description": "Role lacks 'admissions' permission"},
         409: {"model": schemas.ErrorResponse, "description": "Given id already exists"},
@@ -687,8 +724,10 @@ def create_cycle(payload: schemas.AdmissionCycleIn, db: Session = Depends(get_db
         results_published=payload.results_published,
     )
     db.add(row)
+    if payload.class_ids:
+        _set_cycle_classes(db, row_id, payload.class_ids)
     db.commit()
-    return row
+    return _build_cycle_out(db, row)
 
 
 @router.put(
@@ -696,7 +735,9 @@ def create_cycle(payload: schemas.AdmissionCycleIn, db: Session = Depends(get_db
     response_model=schemas.AdmissionCycleOut,
     summary="Update an admission cycle",
     description="Partial update. If setting `is_active=True`, all OTHER cycles are set to "
-    "`is_active=False` in the same transaction - only one active cycle at a time.",
+    "`is_active=False` in the same transaction - only one active cycle at a time. If "
+    "`class_ids` is provided (even as an empty list), it REPLACES the cycle's class list "
+    "entirely; omit it to leave the existing class list untouched.",
     responses={
         403: {"model": schemas.ErrorResponse, "description": "Role lacks 'admissions' permission"},
         404: {"model": schemas.ErrorResponse, "description": "No cycle with that id"},
@@ -715,12 +756,15 @@ def update_cycle(
             detail={"error_code": "CYCLE_NOT_FOUND", "message": f"No admission cycle with id '{cycle_id}'"},
         )
     fields = payload.model_dump(exclude_unset=True)
+    class_ids = fields.pop("class_ids", None)
     if fields.get("is_active") is True:
         db.query(models.AdmissionCycle).filter(models.AdmissionCycle.id != cycle_id).update(
             {models.AdmissionCycle.is_active: False}
         )
     for field, value in fields.items():
         setattr(row, field, value)
+    if class_ids is not None:
+        _set_cycle_classes(db, cycle_id, class_ids)
     db.commit()
     db.refresh(row)
-    return row
+    return _build_cycle_out(db, row)
