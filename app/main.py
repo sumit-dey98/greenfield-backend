@@ -7,8 +7,21 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from .config import settings
 from .database import get_db
-from .routers import admin, admin_academic, admin_audit, admin_cms, admin_people, auth, public, students, teachers
+from .routers import (
+    admin,
+    admin_academic,
+    admin_admissions,
+    admin_audit,
+    admin_cms,
+    admin_people,
+    admissions_public,
+    auth,
+    public,
+    students,
+    teachers,
+)
 
 logger = logging.getLogger("greenfield")
 
@@ -158,6 +171,20 @@ tags_metadata = [
         "description": "No authentication required. Read-only, pre-filtered to published/active/"
         "non-expired content only - this is what the public website consumes.",
     },
+    {
+        "name": "admissions-public",
+        "description": "No account-based auth. Public admission application submission, "
+        "reference-number + contact-value verification (issues a short-lived admission-access "
+        "token), and public-safe status lookup. IP-rate-limited and lockout-protected against "
+        "abuse via Postgres-backed SubmissionAttempt/VerifyAttempt tables.",
+    },
+    {
+        "name": "admin-admissions",
+        "description": "Full admission-pipeline management: application list/detail, status "
+        "transitions, exam scheduling, grading assignment, merit list, interview scheduling/"
+        "outcome, bulk actions, and admission cycle CRUD. Requires the `admissions` permission "
+        "(super_admin/admin only).",
+    },
 ]
 
 app = FastAPI(
@@ -170,7 +197,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict to your frontend origin(s) in production
+    allow_origins=settings.cors_origins_list,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -183,6 +210,8 @@ app.include_router(admin_academic.router)
 app.include_router(admin_cms.router)
 app.include_router(admin_people.router)
 app.include_router(admin_audit.router)
+app.include_router(admin_admissions.router)
+app.include_router(admissions_public.router)
 app.include_router(public.router)
 
 

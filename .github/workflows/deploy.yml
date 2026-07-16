@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Compile-check the app
+        run: python -m compileall app
+
+# Deploys are handled natively by Render's GitHub integration: pushing to `main` triggers
+# Render to pull the repo, build the Dockerfile, and redeploy automatically. This workflow
+# is just the pre-deploy sanity check (fails fast on broken syntax/imports before Render
+# even starts a build). See DEPLOY.md for the one-time Render setup.

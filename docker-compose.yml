@@ -4,10 +4,31 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # Values are interpolated from ./.env — nothing hardcoded here.
+      # Values are interpolated from ./.env — nothing hardcoded here. Compose does NOT
+      # auto-forward every key in .env into the container; each one actually used by the app
+      # must be listed explicitly here, or it silently falls back to its code default inside
+      # the container even though it's set correctly on the host.
+      #
+      # The numeric ADMISSION_* vars use the ${VAR:-default} form (falls back to the literal
+      # default, matching app/config.py's Settings defaults, if unset OR empty in .env) -
+      # without this, an unset var becomes an empty string in the container, which pydantic
+      # fails to parse as int and crashes the app on startup. CLOUDINARY_*/CAPTCHA_SECRET_KEY
+      # are Optional[str] in Settings so an empty string is safe for those.
+      #
       # DATABASE_URL_DOCKER points at the host's existing Postgres via host.docker.internal.
       - DATABASE_URL=${DATABASE_URL_DOCKER}
       - SECRET_KEY=${SECRET_KEY}
+      - CLOUDINARY_CLOUD_NAME=${CLOUDINARY_CLOUD_NAME}
+      - CLOUDINARY_API_KEY=${CLOUDINARY_API_KEY}
+      - CLOUDINARY_API_SECRET=${CLOUDINARY_API_SECRET}
+      - CAPTCHA_SECRET_KEY=${CAPTCHA_SECRET_KEY}
+      - ADMISSION_MAX_FILE_SIZE_BYTES=${ADMISSION_MAX_FILE_SIZE_BYTES:-10240}
+      - ADMISSION_MAX_PHOTO_SIZE_BYTES=${ADMISSION_MAX_PHOTO_SIZE_BYTES:-20480}
+      - ADMISSION_MAX_FILES=${ADMISSION_MAX_FILES:-4}
+      - ADMISSION_RATE_LIMIT_PER_HOUR=${ADMISSION_RATE_LIMIT_PER_HOUR:-5}
+      - ADMISSION_RATE_LIMIT_PER_DAY=${ADMISSION_RATE_LIMIT_PER_DAY:-20}
+      - ADMISSION_VERIFY_MAX_ATTEMPTS=${ADMISSION_VERIFY_MAX_ATTEMPTS:-5}
+      - ADMISSION_VERIFY_LOCKOUT_MINUTES=${ADMISSION_VERIFY_LOCKOUT_MINUTES:-30}
     extra_hosts:
       # Makes host.docker.internal resolve to the host on Linux (no-op on Docker Desktop).
       - "host.docker.internal:host-gateway"

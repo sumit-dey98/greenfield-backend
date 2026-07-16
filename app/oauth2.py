@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import ExpiredSignatureError, JWTError, jwt
 
@@ -10,11 +10,11 @@ bearer_scheme = HTTPBearer()
 
 # Mirrors the PERMISSIONS map in the frontend AuthProvider.
 ADMIN_PERMISSIONS = {
-    "super_admin": {"cms": True, "academic": True, "users": True},
-    "admin": {"cms": True, "academic": True, "users": False},
-    "editor": {"cms": True, "academic": False, "users": False},
-    "mock_admin": {"cms": False, "academic": False, "users": False},
-    "mock_editor": {"cms": False, "academic": False, "users": False},
+    "super_admin": {"cms": True, "academic": True, "users": True, "admissions": True},
+    "admin": {"cms": True, "academic": True, "users": False, "admissions": True},
+    "editor": {"cms": True, "academic": False, "users": False, "admissions": False},
+    "mock_admin": {"cms": False, "academic": False, "users": False, "admissions": False},
+    "mock_editor": {"cms": False, "academic": False, "users": False, "admissions": False},
 }
 
 
@@ -96,3 +96,66 @@ def require_admin_permission(action: str):
         return principal
 
     return checker
+
+
+# ---------------------------------------------------------------------------
+# Admission-access token (public applicant status flow)
+# ---------------------------------------------------------------------------
+# A distinct token `type` ("admission_access") keeps this from ever being confusable with a
+# real student/teacher/admin access/refresh token - decode_token() elsewhere never accepts it,
+# and this module's own decoder rejects anything that isn't exactly this type.
+
+
+def create_admission_access_token(reference_number: str, expires_minutes: int = 120) -> str:
+    return _create_token(
+        {"sub": reference_number, "type": "admission_access"},
+        timedelta(minutes=expires_minutes),
+    )
+
+
+def decode_admission_access_token(token: str) -> str:
+    try:
+        payload = jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+    except ExpiredSignatureError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error_code": "INVALID_OR_EXPIRED_TOKEN", "message": "Admission access token has expired"},
+        )
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error_code": "INVALID_OR_EXPIRED_TOKEN", "message": "Could not validate admission access token"},
+        )
+
+    if payload.get("type") != "admission_access" or not payload.get("sub"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error_code": "INVALID_OR_EXPIRED_TOKEN", "message": "Not a valid admission access token"},
+        )
+    return payload["sub"]
+
+
+def require_admission_access(
+    reference_number: str,
+    x_admission_token: str = Header(
+        ...,
+        alias="X-Admission-Token",
+        description="The admission access token returned by POST /admissions/{reference_number}/verify. "
+        "Sent as a header (not a query param) so it isn't accidentally logged in server access logs "
+        "or browser history the way a query string would be - a simple fetch() call can set this "
+        "header with no extra plumbing on the Next.js side.",
+    ),
+) -> str:
+    """FastAPI dependency for the public status-lookup endpoint: decodes the token AND verifies
+    its `sub` (reference_number) matches the path param, so one applicant's token can't be
+    replayed against another applicant's reference_number."""
+    token_ref = decode_admission_access_token(x_admission_token)
+    if token_ref != reference_number:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error_code": "TOKEN_REFERENCE_MISMATCH",
+                "message": "This admission access token was not issued for this reference number",
+            },
+        )
+    return reference_number

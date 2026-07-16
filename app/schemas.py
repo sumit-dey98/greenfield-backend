@@ -498,6 +498,19 @@ class ClassOut(BaseModel):
         from_attributes = True
 
 
+class ClassPublicOut(BaseModel):
+    """Minimal public-facing class listing (e.g. for the admission form's "Applying for
+    Class" dropdown) - no room/teacher_id, which are internal scheduling/staffing detail."""
+
+    id: str
+    name: Optional[str] = None
+    grade: Optional[int] = None
+    section: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
 class ClassRosterOut(BaseModel):
     class_info: ClassOut
     students: List[StudentOut]
@@ -872,6 +885,7 @@ class EventOut(BaseModel):
     author_id: Optional[str] = None
     author_name: Optional[str] = None
     published: Optional[bool] = False
+    featured: Optional[bool] = False
     created_at: Optional[datetime] = None
 
     class Config:
@@ -893,6 +907,7 @@ class EventIn(BaseModel):
     cover_image: Optional[str] = None
     author_name: Optional[str] = None
     published: bool = False
+    featured: bool = False
 
 
 class EventUpdate(BaseModel):
@@ -905,6 +920,7 @@ class EventUpdate(BaseModel):
     cover_image: Optional[str] = None
     author_name: Optional[str] = None
     published: Optional[bool] = None
+    featured: Optional[bool] = None
 
 
 class TestimonialOut(BaseModel):
@@ -940,6 +956,12 @@ class TestimonialUpdate(BaseModel):
 class AdmissionStatusOut(BaseModel):
     id: str
     value: bool
+    # Active admission cycle info, populated by the public endpoint so the applicant-facing
+    # page can show a real year/name instead of a hardcoded one. Null on the admin toggle
+    # endpoint (AdmissionOpen has no relation to AdmissionCycle - these are assembled
+    # manually in the router, not via from_attributes on a single row).
+    cycle_name: Optional[str] = None
+    academic_year: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -947,3 +969,418 @@ class AdmissionStatusOut(BaseModel):
 
 class AdmissionStatusUpdate(BaseModel):
     value: bool
+
+
+# ---- Admission System (applications, grading, interviews, merit list) ----
+# See app/routers/admissions_public.py, app/routers/admin_admissions.py, and the admission-
+# grading additions to app/routers/teachers.py. Distinct from AdmissionStatusOut/Update above
+# (the pre-existing open/closed toggle) - this is the actual applicant/application pipeline.
+
+
+class ApplicationStatus(str, Enum):
+    submitted = "submitted"
+    under_review = "under_review"
+    screening_rejected = "screening_rejected"
+    exam_scheduled = "exam_scheduled"
+    exam_completed = "exam_completed"
+    grading_assigned = "grading_assigned"
+    graded = "graded"
+    interview_scheduled = "interview_scheduled"
+    interview_completed = "interview_completed"
+    waitlisted = "waitlisted"
+    accepted = "accepted"
+    rejected = "rejected"
+    withdrawn = "withdrawn"
+
+
+class ContactMethod(str, Enum):
+    email = "email"
+    phone = "phone"
+
+
+class InterviewOutcome(str, Enum):
+    recommend_accept = "recommend_accept"
+    recommend_reject = "recommend_reject"
+    recommend_waitlist = "recommend_waitlist"
+
+
+class InterviewMode(str, Enum):
+    in_person = "in_person"
+    phone = "phone"
+    video = "video"
+
+
+class CycleClassOut(BaseModel):
+    """Minimal (id, name) view of a class attached to an admission cycle."""
+
+    id: str
+    name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class AdmissionCycleOut(BaseModel):
+    id: str
+    name: str
+    academic_year: Optional[str] = None
+    is_active: bool
+    seats_available: Optional[int] = None
+    results_published: bool
+    created_at: Optional[datetime] = None
+    classes: List[CycleClassOut] = []
+
+    class Config:
+        from_attributes = True
+
+
+class AdmissionCycleIn(BaseModel):
+    id: Optional[str] = None  # auto-generated (cyc_xxxxxxxx) if omitted
+    name: str
+    academic_year: Optional[str] = None
+    is_active: bool = True
+    seats_available: Optional[int] = None
+    results_published: bool = False
+    class_ids: List[str] = []  # which classes this cycle accepts applications for
+
+
+class AdmissionCycleUpdate(BaseModel):
+    name: Optional[str] = None
+    academic_year: Optional[str] = None
+    is_active: Optional[bool] = None
+    seats_available: Optional[int] = None
+    results_published: Optional[bool] = None
+    class_ids: Optional[List[str]] = None  # if provided, replaces the cycle's class list entirely
+
+
+class ApplicationIn(BaseModel):
+    """Public submission payload (multipart form fields in the actual endpoint - see
+    admissions_public.py, which maps these onto FastAPI Form() params). Exactly one of
+    contact_email/contact_phone must be set, matching contact_method."""
+
+    student_name: str
+    dob: Optional[date_type] = None
+    gender: Optional[str] = None
+    applying_class: Optional[str] = None
+    blood_group: Optional[str] = None
+    previous_school: Optional[str] = None
+    contact_method: ContactMethod
+    contact_email: Optional[EmailStr] = None
+    contact_phone: Optional[str] = None
+    guardian_name: Optional[str] = None
+    guardian_relationship: Optional[str] = None
+    guardian_phone: Optional[str] = None
+    guardian_email: Optional[EmailStr] = None
+    guardian_occupation: Optional[str] = None
+    address: Optional[str] = None
+    medical_conditions: Optional[str] = None
+    extracurricular: Optional[str] = None
+    notes: Optional[str] = None
+    captcha_token: str
+
+    @model_validator(mode="after")
+    def _check_contact_matches_method(self):
+        if self.contact_method == ContactMethod.email:
+            if not self.contact_email or self.contact_phone:
+                raise ValueError("contact_method is 'email' - contact_email must be set and contact_phone must be omitted")
+        else:
+            if not self.contact_phone or self.contact_email:
+                raise ValueError("contact_method is 'phone' - contact_phone must be set and contact_email must be omitted")
+        return self
+
+
+class ApplicationSubmitOut(BaseModel):
+    reference_number: str
+    status: str
+    duplicate: bool = False
+    message: str
+
+
+class ApplicationVerifyIn(BaseModel):
+    contact_value: str
+
+
+class ApplicationVerifyOut(BaseModel):
+    access_token: str
+    expires_in: int  # seconds
+
+
+class ApplicationDocumentOut(BaseModel):
+    """Admin/full view of an uploaded document."""
+
+    id: str
+    application_id: str
+    url: str
+    public_id: Optional[str] = None
+    file_name: Optional[str] = None
+    mime_type: Optional[str] = None
+    size_bytes: Optional[int] = None
+    doc_type: Optional[str] = None
+    uploaded_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ApplicationDocumentPublicOut(BaseModel):
+    """Public/applicant-facing view - no internal ids, no Cloudinary public_id."""
+
+    url: str
+    file_name: Optional[str] = None
+    doc_type: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ApplicationTrackExamScheduleOut(BaseModel):
+    exam_date: Optional[date_type] = None
+    exam_time: Optional[str] = None
+    venue: Optional[str] = None
+    room: Optional[str] = None
+    roll_number: str
+
+    class Config:
+        from_attributes = True
+
+
+class ApplicationTrackInterviewOut(BaseModel):
+    interview_date: Optional[date_type] = None
+    interview_time: Optional[str] = None
+    mode: Optional[str] = None
+    room: Optional[str] = None
+    meeting_link: Optional[str] = None
+    phone_number: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ApplicationTrackOut(BaseModel):
+    """Public-safe status lookup (GET /admissions/{ref}/status). Includes the applicant's own
+    submitted data (safe to show back to them) but never internal-only fields: no notes, no
+    decision_notes, no interview_outcome/interview_notes, no contact fields, no grading/teacher
+    identity, no medical_conditions/extracurricular/notes (kept internal, not shown here)."""
+
+    reference_number: str
+    student_name: str
+    photo_url: Optional[str] = None
+    applying_class: Optional[str] = None
+    dob: Optional[date_type] = None
+    gender: Optional[str] = None
+    blood_group: Optional[str] = None
+    previous_school: Optional[str] = None
+    guardian_name: Optional[str] = None
+    guardian_relationship: Optional[str] = None
+    guardian_phone: Optional[str] = None
+    guardian_email: Optional[str] = None
+    address: Optional[str] = None
+    visible_status: str
+    cycle_name: Optional[str] = None
+    # Own entrance-exam score once graded - safe to show back to the applicant. Deliberately
+    # NOT their rank/merit-list position, which reveals competitive standing before a final
+    # decision and is kept admin-only (see MeritListEntryOut).
+    entrance_score: Optional[int] = None
+    documents: List[ApplicationDocumentPublicOut] = []
+    exam_schedule: Optional[ApplicationTrackExamScheduleOut] = None
+    interview: Optional[ApplicationTrackInterviewOut] = None
+
+
+class ApplicationAdminOut(BaseModel):
+    """Admin list-view - lighter than ApplicationDetailOut."""
+
+    id: str
+    reference_number: str
+    cycle_id: Optional[str] = None
+    student_name: str
+    photo_url: Optional[str] = None
+    applying_class: Optional[str] = None
+    contact_method: str
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
+    status: str
+    entrance_score: Optional[int] = None
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ExamScheduleOut(BaseModel):
+    exam_date: Optional[date_type] = None
+    exam_time: Optional[str] = None
+    venue: Optional[str] = None
+    room: Optional[str] = None
+    roll_number: str
+
+    class Config:
+        from_attributes = True
+
+
+class GradingAssignmentOut(BaseModel):
+    teacher_id: str
+    teacher_name: Optional[str] = None
+    status: str
+    assigned_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ExamResultOut(BaseModel):
+    marks: Optional[int] = None
+    total: Optional[int] = None
+    remarks: Optional[str] = None
+    graded_by: Optional[str] = None
+    graded_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class InterviewOut(BaseModel):
+    interview_date: Optional[date_type] = None
+    interview_time: Optional[str] = None
+    mode: Optional[str] = None
+    interviewer_name: Optional[str] = None
+    room: Optional[str] = None
+    meeting_link: Optional[str] = None
+    phone_number: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ApplicationDetailOut(BaseModel):
+    """Admin full detail - always shows the real `status`, never the masked visible_status
+    used by the public track endpoint."""
+
+    id: str
+    reference_number: str
+    cycle_id: Optional[str] = None
+    student_name: str
+    photo_url: Optional[str] = None
+    dob: Optional[date_type] = None
+    gender: Optional[str] = None
+    applying_class: Optional[str] = None
+    blood_group: Optional[str] = None
+    previous_school: Optional[str] = None
+    contact_method: str
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
+    guardian_name: Optional[str] = None
+    guardian_relationship: Optional[str] = None
+    guardian_phone: Optional[str] = None
+    guardian_email: Optional[str] = None
+    guardian_occupation: Optional[str] = None
+    address: Optional[str] = None
+    medical_conditions: Optional[str] = None
+    extracurricular: Optional[str] = None
+    notes: Optional[str] = None
+    status: str
+    entrance_score: Optional[int] = None
+    interview_outcome: Optional[str] = None
+    interview_notes: Optional[str] = None
+    decision_notes: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    documents: List[ApplicationDocumentOut] = []
+    exam_schedule: Optional[ExamScheduleOut] = None
+    grading_assignment: Optional[GradingAssignmentOut] = None
+    exam_result: Optional[ExamResultOut] = None
+    interview: Optional[InterviewOut] = None
+
+
+class ApplicationStatusUpdateIn(BaseModel):
+    status: ApplicationStatus
+    decision_notes: Optional[str] = None
+
+
+class ExamScheduleIn(BaseModel):
+    exam_date: Optional[date_type] = None
+    exam_time: Optional[str] = None
+    venue: Optional[str] = None
+    room: Optional[str] = None
+
+
+class BulkExamScheduleIn(BaseModel):
+    application_ids: List[str]
+    exam_date: Optional[date_type] = None
+    exam_time: Optional[str] = None
+    venue: Optional[str] = None
+    room: Optional[str] = None
+
+
+class GradingAssignmentIn(BaseModel):
+    teacher_id: str
+
+
+class BulkGradingAssignmentIn(BaseModel):
+    application_ids: List[str]
+    teacher_id: str
+
+
+class ApplicationGradingOut(BaseModel):
+    """BLIND fields only - grading is anonymous. Never add student_name/contact/guardian/
+    address here even if it seems convenient; see teachers.py grading endpoints."""
+
+    application_id: str
+    roll_number: str
+    applying_class: Optional[str] = None
+    exam_date: Optional[date_type] = None
+    status: str  # assigned | graded
+    marks: Optional[int] = None
+    total: Optional[int] = None
+
+
+class GradingResultIn(BaseModel):
+    marks: int = Field(ge=0)
+    total: Optional[int] = 100
+    remarks: Optional[str] = None
+
+
+class InterviewScheduleIn(BaseModel):
+    interview_date: Optional[date_type] = None
+    interview_time: Optional[str] = None
+    mode: InterviewMode
+    interviewer_name: Optional[str] = None
+    room: Optional[str] = None  # in_person
+    meeting_link: Optional[str] = None  # video
+    phone_number: Optional[str] = None  # phone
+
+
+class InterviewOutcomeIn(BaseModel):
+    interview_outcome: InterviewOutcome
+    interview_notes: Optional[str] = None
+
+
+class MeritListEntryOut(BaseModel):
+    application_id: str
+    reference_number: str
+    student_name: str
+    applying_class: Optional[str] = None
+    entrance_score: Optional[int] = None
+    rank: int
+    status: str
+    interview_outcome: Optional[str] = None
+
+
+class MeritListOut(BaseModel):
+    items: List[MeritListEntryOut]
+    seats_available: Optional[int] = None
+
+
+class BulkStatusIn(BaseModel):
+    application_ids: List[str]
+    status: ApplicationStatus
+    decision_notes: Optional[str] = None
+
+
+class BulkActionSkip(BaseModel):
+    id: str
+    reason: str
+
+
+class BulkStatusOut(BaseModel):
+    updated: List[str]
+    skipped: List[BulkActionSkip]
