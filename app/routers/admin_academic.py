@@ -59,6 +59,14 @@ def _times_overlap(start_a: str, end_a: str, start_b: str, end_b: str) -> bool:
     return start_a < end_b and start_b < end_a
 
 
+def _period_label(period) -> str:
+    """Human-readable identifier for error messages — the admin-set label if there is
+    one, otherwise the time range. Never the raw id, which is meaningless in the UI."""
+    if period.label:
+        return f"'{period.label}'"
+    return f"{period.start_time}-{period.end_time}"
+
+
 def _check_period_conflicts(
     db: Session, sort_order: int, start_time: str, end_time: str, exclude_id: Optional[str] = None
 ):
@@ -73,7 +81,7 @@ def _check_period_conflicts(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={
                     "error_code": "PERIOD_SORT_ORDER_CONFLICT",
-                    "message": f"sort_order {sort_order} is already used by period '{other.id}'",
+                    "message": f"sort_order {sort_order} is already used by period {_period_label(other)}",
                 },
             )
         if _times_overlap(start_time, end_time, other.start_time, other.end_time):
@@ -81,7 +89,7 @@ def _check_period_conflicts(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={
                     "error_code": "PERIOD_TIME_CONFLICT",
-                    "message": f"{start_time}-{end_time} overlaps period '{other.id}' "
+                    "message": f"{start_time}-{end_time} overlaps period {_period_label(other)} "
                     f"({other.start_time}-{other.end_time})",
                 },
             )
@@ -677,41 +685,94 @@ def get_period(period_id: str, db: Session = Depends(get_db), _principal: dict =
 @router.post(
     "/periods",
     tags=["admin-periods"],
-    response_model=schemas.PeriodOut,
+    response_model=List[schemas.PeriodOut],
     status_code=status.HTTP_201_CREATED,
-    summary="Create a period",
-    description="`id` is auto-generated (`per_xxxxxxxx`) if omitted. `start_time`/`end_time` must "
-    "be 24-hour `HH:MM` with start before end. `sort_order` and time range must not collide "
-    "with an existing period.",
+    summary="Replace all periods",
+    description="Bulk-replaces the entire period list in one transaction. Entries with an `id` "
+    "matching an existing period update it in place (schedule entries referencing that id stay "
+    "valid); entries without an `id`, or with one not already in use, are created; any existing "
+    "period whose `id` is missing from the submitted list is deleted. Sending the whole set "
+    "together — rather than one request per period — lets periods that only make sense relative "
+    "to each other (e.g. shrinking one while growing its neighbour) be validated as a unit instead "
+    "of transiently conflicting with rows that are about to change too. `sort_order` and time "
+    "range are checked for collisions within the submitted list, not against the rows being "
+    "replaced.",
     responses={
         403: {"model": schemas.ErrorResponse, "description": "Role lacks 'academic' permission"},
         409: {
             "model": schemas.ErrorResponse,
-            "description": "Given id already exists, sort_order is taken, or time range overlaps another period",
+            "description": "Two submitted periods collide (sort_order or time range), or a period "
+            "being removed still has schedule entries",
         },
         422: {"model": schemas.ValidationErrorResponse, "description": "Malformed body, bad time format, or start after end"},
     },
 )
-def create_period(payload: schemas.PeriodIn, db: Session = Depends(get_db), _principal: dict = ACADEMIC):
-    _check_period_conflicts(db, payload.sort_order, payload.start_time, payload.end_time)
+def replace_periods(payload: List[schemas.PeriodIn], db: Session = Depends(get_db), _principal: dict = ACADEMIC):
+    # Validate the submitted set against itself — sort_order and time-range collisions only,
+    # since every existing row is being replaced and shouldn't be checked against its own old state.
+    for i, a in enumerate(payload):
+        for b in payload[i + 1:]:
+            if a.sort_order == b.sort_order:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error_code": "PERIOD_SORT_ORDER_CONFLICT",
+                        "message": f"sort_order {a.sort_order} is used by both "
+                        f"{_period_label(a)} and {_period_label(b)}",
+                    },
+                )
+            if _times_overlap(a.start_time, a.end_time, b.start_time, b.end_time):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error_code": "PERIOD_TIME_CONFLICT",
+                        "message": f"{a.start_time}-{a.end_time} overlaps period {_period_label(b)} "
+                        f"({b.start_time}-{b.end_time})",
+                    },
+                )
 
-    row_id = payload.id or utils.generate_id("per_")
-    if db.query(models.Period).filter(models.Period.id == row_id).first():
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"error_code": "ID_ALREADY_EXISTS", "message": f"Period '{row_id}' already exists"},
-        )
-    row = models.Period(
-        id=row_id,
-        sort_order=payload.sort_order,
-        start_time=payload.start_time,
-        end_time=payload.end_time,
-        is_break=payload.is_break,
-        label=payload.label,
-    )
-    db.add(row)
+    existing = {row.id: row for row in db.query(models.Period).all()}
+    submitted_ids = {p.id for p in payload if p.id}
+
+    # A period being dropped must not orphan schedule entries still pointing at it.
+    for row_id, row in existing.items():
+        if row_id not in submitted_ids:
+            _check_in_use(
+                db,
+                models.Schedule,
+                models.Schedule.period_id,
+                row_id,
+                "PERIOD_IN_USE",
+                f"Period {_period_label(row)} still has schedule entries — remove those first",
+            )
+
+    for row_id, row in list(existing.items()):
+        if row_id not in submitted_ids:
+            db.delete(row)
+
+    result_rows = []
+    for item in payload:
+        row_id = item.id
+        row = existing.get(row_id) if row_id else None
+        if row_id and not row:
+            # Client-supplied id that isn't an existing period — treat as a new row with that id.
+            row = models.Period(id=row_id)
+            db.add(row)
+        elif not row_id:
+            row = models.Period(id=utils.generate_id("per_"))
+            db.add(row)
+
+        row.sort_order = item.sort_order
+        row.start_time = item.start_time
+        row.end_time = item.end_time
+        row.is_break = item.is_break
+        row.label = item.label
+        result_rows.append(row)
+
     db.commit()
-    return row
+    for row in result_rows:
+        db.refresh(row)
+    return sorted(result_rows, key=lambda r: r.sort_order)
 
 
 @router.put(
